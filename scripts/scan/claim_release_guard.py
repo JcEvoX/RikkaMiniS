@@ -240,15 +240,35 @@ STATE_PUBLISH_RE = re.compile(r"\b_state\s*\.\s*value\s*=(?!=)")
 SLOT_CLEAR_RE = re.compile(r"\btermuxSession\s*=(?!=)")
 LIVE_REMOVE_RE = re.compile(r"\bliveSessions\s*\.\s*(?:remove\w*|clear)\b")
 
-# [1048-B08] Turn-entry claim timing / setup-shell ownership.
-SHELL_SCOPE = "com/rikkaminis/app/ui/chat/ChatViewModel.kt"
-FUN_ANY_RE = re.compile(r"\bfun\s+([A-Za-z_]\w*)\s*\(")
+# [1048-B08 / dv29-B01] Turn-entry claim timing / setup-shell ownership.
+# The subject is DERIVED, never a hardcoded file: every `ui/chat/*.kt` that
+# carries a claim write or a stream-job creation is a turn-entry file. The
+# 1048 wave pinned ChatViewModel.kt alone, so the split-out extension files
+# (ChatRetryOps / ChatModelRouting / ChatTurnPersistence) — which hold the very
+# same shells — were invisible (dv29 B-01: four turn entries unguarded).
+SHELL_DIR_RE = re.compile(r"^com/rikkaminis/app/ui/chat/[^/]+\.kt$")
+# Extension receivers count: `fun ChatViewModel.retryLast()` is a turn entry.
+FUN_ANY_RE = re.compile(
+    r"\bfun\s+(?:<[^>]*>\s*)?(?:[A-Za-z_][\w.]*\s*\.\s*)?([A-Za-z_]\w*)\s*\(")
 SUSPEND_TAIL_RE = re.compile(r"\bsuspend\s+$")
 CLAIM_ON_RE = re.compile(r"\b_isStreaming\s*\.\s*value\s*=\s*true")
 LAUNCH_CALL_RE = re.compile(r"\blaunch\s*\(")
-STREAM_JOB_ASSIGN_RE = re.compile(r"\bstreamJob\s*=\s*launch\s*\(")
+# Both shapes: `streamJob = launch(` and `streamJob = viewModelScope.launch(`
+# (ChatTurnPersistence.runRerunStreamTail used the second one).
+STREAM_JOB_ASSIGN_RE = re.compile(
+    r"\bstreamJob\s*=\s*(?:[A-Za-z_]\w*\s*\.\s*)*launch\b")
 JOB_FIELD_ASSIGN_TAIL_RE = re.compile(
     r"([A-Za-z_]\w*)\s*=\s*[A-Za-z_][\w.]*\.\s*$")
+# `if (_isStreaming.value)` with no comparison: the opportunistic-continuation
+# re-check (queue drain) — "only claim the turn if nobody owns it".
+IN_FLIGHT_CHECK_RE = re.compile(r"\bif\s*\(\s*_isStreaming\s*\.\s*value\s*\)")
+# A claim/stream identity comparison. Operands are validated separately (a
+# value captured outside the coroutine, or a parameter — a re-read of the same
+# field is a tautology, see identity_operand_ok).
+IDENTITY_COMPARE_RE = re.compile(r"(!==|!=|===|==)")
+PURE_ASSIGN_RE = re.compile(
+    r"^\s*(?:val|var)?\s*[A-Za-z_]\w*(?:\s*\.\s*[A-Za-z_]\w*)*\s*=(?!=)\s*"
+    r"[^(){}]*\s*$")
 
 # Audited (file, key) pairs where the ungated release is demonstrably safe in
 # the current architecture. Every entry states WHY — re-audit when the file's
@@ -687,6 +707,146 @@ def iter_fun_bodies(text):
         yield m.group(1), brace, end, is_suspend
 
 
+JOB_ASSIGN_ANY_RE = re.compile(
+    r"\b([A-Za-z_]\w*)\s*=\s*(?:[A-Za-z_]\w*\s*\.\s*)*launch\b")
+
+
+def derived_scope(clean):
+    """[dv29-B01] The C-B8 subject set, DERIVED: every `ui/chat/*.kt` that
+    carries a turn-entry shape (a claim write or a stream-job creation).
+
+    Hardcoding `ChatViewModel.kt` was the dv29 B-01 root cause: the turn entries
+    moved into ChatRetryOps / ChatModelRouting / ChatTurnPersistence, and a
+    hardcoded subject list makes a gate that keeps reporting "clean" over the
+    files that now hold the shells. A file with neither shape cannot contain a
+    turn entry, so the derivation loses nothing.
+    """
+    out = []
+    for rel in sorted(clean):
+        if not SHELL_DIR_RE.match(rel):
+            continue
+        text = "\n".join(clean[rel])
+        if CLAIM_ON_RE.search(text) or STREAM_JOB_ASSIGN_RE.search(text):
+            out.append(rel)
+    return out
+
+
+def job_field_reads(texts):
+    """Job fields that something actually reads, tree-wide.
+
+    Tree-wide on purpose: the shell is assigned in ChatRetryOps.kt while the
+    reader (`sendShellJob?.cancel()` in cancelStream) lives in ChatViewModel.kt
+    — asking one file would flag every split-out shell as unreachable.
+    """
+    joined = "\n".join(texts)
+    reads = set()
+    for field in set(JOB_ASSIGN_ANY_RE.findall(joined)):
+        for m in re.finditer(r"(?<![\w.])" + re.escape(field) + r"\b", joined):
+            before = joined[max(0, m.start() - 8):m.start()]
+            if re.search(r"\b(?:val|var)\s+$", before):
+                continue  # declaration
+            if joined[m.end():m.end() + 24].lstrip()[:1] == "=":
+                continue  # (re)assignment
+            reads.add(field)
+            break
+    return reads
+
+
+def _params_before(text, body_start):
+    """Parameter names of the `fun` whose body starts at `body_start`."""
+    head = text[max(0, body_start - 800):body_start]
+    idx = head.rfind("fun ")
+    if idx < 0:
+        return set()
+    p = head.find("(", idx)
+    if p < 0:
+        return set()
+    cond = extract_condition(head, p)
+    if cond is None:
+        return set()
+    return {m.group(1) for m in re.finditer(r"\b([A-Za-z_]\w*)\s*:", cond)}
+
+
+def _coroutine_anchor(text, body_start, site):
+    """Start offset of the innermost `launch { … }` body containing `site`.
+
+    The revocation window belongs to the coroutine that owns the stream start:
+    a comparison outside it (the entry guard, which ran before the setup) is
+    not evidence that the claim still holds when the stream starts.
+    """
+    anchor = body_start
+    for m in LAUNCH_CALL_RE.finditer(text, body_start, site):
+        brace = text.find("{", m.end(), min(len(text), m.end() + 240))
+        if brace < 0:
+            continue
+        end = match_brace(text, brace)
+        if end is None or end < site:
+            continue
+        anchor = brace
+    return anchor
+
+
+def _identity_guard(text, body_start, anchor, site, params):
+    """The claim-revocation bail-out before `site`, or None.
+
+    Accepted operands are the identity values the claim owns — a parameter of
+    the function, or a local captured BEFORE the coroutine body started
+    (`val sendEpoch = streamingClaimEpoch` at entry, then passed through the
+    suspension points). A value captured INSIDE the same coroutine is rejected:
+    comparing it with the field it was read from is a tautology that can never
+    catch a Stop (dv29 B-01 arm: `val e = streamingClaimEpoch; if (e !=
+    streamingClaimEpoch)`).
+    """
+    window = text[anchor:site]
+    # Locals of THIS function captured before the coroutine started. Class-level
+    # `var streamingClaimEpoch = 0L` must not count: it is the field being
+    # compared, and accepting it would certify the self-comparison below.
+    captured = set(re.findall(r"\b(?:val|var)\s+([A-Za-z_]\w*)\s*=",
+                              text[body_start + 1:anchor]))
+    for m in re.finditer(r"\bif\s*\(", window):
+        p = m.end() - 1
+        cond = extract_condition(window, p)
+        if cond is None or not IDENTITY_COMPARE_RE.search(cond):
+            continue
+        ids = set(re.findall(r"[A-Za-z_]\w*", cond))
+        if not (ids & (params | captured)):
+            continue
+        after = window[p + len(cond) + 2:]
+        brace = after.find("{")
+        if brace < 0 or brace > 48:
+            continue
+        end = match_brace(after, brace)
+        block = after[brace:(end + 1) if end else brace + 240]
+        if RETURN_RE.search(block):
+            return cond.strip()
+    return None
+
+
+def _claim_then_atomic(text, anchor, site):
+    """True when the claim and the stream start are one non-suspending block.
+
+    Kotlin coroutines only yield at suspension points: if nothing but plain
+    assignments/declarations sits between `_isStreaming.value = true` and the
+    `streamJob = launch(…)`, no other task can interleave and there is nothing
+    for a guard to protect (the queue-drain shape,
+    ChatQueueInterruption.resumeQueueAfterCancel: claim, publish, capture, launch).
+    Anything else in between — a call, a branch — is a revocation window.
+    """
+    claims = [c for c in CLAIM_ON_RE.finditer(text, anchor, site)]
+    if not claims:
+        return False
+    between = text[claims[-1].end():site]
+    for line in between.split("\n"):
+        s = line.strip()
+        if not s or s in ("{", "}"):
+            continue
+        if PURE_ASSIGN_RE.match(s) or re.match(
+                r"^[A-Za-z_]\w*(?:\s*\.\s*[A-Za-z_]\w*)*\s*(?:\+\+|--)$", s):
+            continue  # assignment / declaration / counter bump — cannot suspend
+        return False
+    return True
+
+
 def synchronous_claim_findings(rel, text, raw_lines):
     """[1048-B08 C-B8] A non-suspend turn entry must claim BEFORE it launches.
 
@@ -698,103 +858,193 @@ def synchronous_claim_findings(rel, text, raw_lines):
 
     `suspend fun` bodies are exempt — they are already coroutines; claiming
     before "the first launch" is not a meaningful requirement there.
+
+    Opportunistic continuations are exempt too: a coroutine that re-checks
+    `if (_isStreaming.value)` before claiming only takes the turn when nobody
+    owns it, so the entry guards were never open. That is the queue-drain shape
+    (ChatQueueInterruption.resumeQueueAfterCancel), which exists BECAUSE a turn
+    was cancelled — holding it in sendShellJob would make Stop cancel the
+    queued drain (dv29 B-01 §4: preserve that shape).
     """
-    if rel != SHELL_SCOPE:
-        return []
     out = []
-    saw_claim_body = False
     for name, start, end, is_suspend in iter_fun_bodies(text):
         body = text[start:end + 1]
         claims = list(CLAIM_ON_RE.finditer(body))
-        if not claims:
-            continue
-        saw_claim_body = True
-        if is_suspend:
+        if not claims or is_suspend:
             continue
         launch = LAUNCH_CALL_RE.search(body)
         if launch is None:
             continue  # nothing suspends: the claim cannot be "inside setup"
-        for c in claims:
-            if c.start() < launch.start():
-                continue
-            line = text[:start + c.start()].count("\n") + 1
-            if escaped(raw_lines, line, CLAIM_ESCAPE_RE):
-                continue
-            out.append(("C-B8", rel, line,
-                        f"{name}(): `_isStreaming.value = true` sits AFTER the "
-                        "body's first `launch(` — the claim is inside the setup "
-                        "coroutine, so the entry guards still read false for the "
-                        "whole setup window and cancelStream() has no handle to "
-                        "stop it (Stop 后诈尸). Claim synchronously, before the "
-                        "launch (see sendMessage)."))
-    if not saw_claim_body:
-        out.append(("C-B8-ROT", rel, 1,
-                    "no function body in this file writes "
-                    "`_isStreaming.value = true` — the claim was renamed or "
-                    "moved out. ROT — update this gate."))
+        late = [c for c in claims if c.start() > launch.start()]
+        if not late:
+            continue
+        if IN_FLIGHT_CHECK_RE.search(body[launch.start():late[0].start()]):
+            continue  # opportunistic continuation — see docstring
+        c = late[0]
+        line = text[:start + c.start()].count("\n") + 1
+        if escaped(raw_lines, line, CLAIM_ESCAPE_RE):
+            continue
+        out.append(("C-B8", rel, line,
+                    f"{name}(): `_isStreaming.value = true` sits AFTER the "
+                    "body's first `launch(` — the claim is inside the setup "
+                    "coroutine, so the entry guards still read false for the "
+                    "whole setup window and cancelStream() has no handle to "
+                    "stop it (Stop 后诈尸). Claim synchronously, before the "
+                    "launch (see sendMessage)."))
     return out
 
 
-def unheld_shell_findings(rel, text, raw_lines):
-    """[1048-B08 C-B8b] The shell that creates the stream job must be held.
+def _depth0(text, body_start, pos):
+    """True when `pos` sits at the function body's own brace depth."""
+    seg = text[body_start + 1:pos]
+    return seg.count("{") == seg.count("}")
 
-    Subject derived from the shape: a `launch(` whose body assigns
-    `streamJob = launch(...)` is the turn's SETUP SHELL; its immediate
-    enclosing `launch(` is the shell itself. That enclosing launch must be the
-    RHS of an assignment to a field (`sendShellJob = viewModelScope.launch(…)
-    { … }`), and that field must be read somewhere else in the file — a handle
-    nobody reads is as good as no handle (cancelStream reads
-    `sendShellJob?.cancel()`).
 
-    A body whose `streamJob = launch(...)` has no enclosing `launch(` is a
+def unheld_shell_findings(rel, text, raw_lines, field_reads, tail_names):
+    """[1048-B08 C-B8b] The shell that starts the turn must be held.
+
+    Two derived subject classes, both "the coroutine the user cannot cancel":
+
+      1. direct — a `launch(` whose body assigns `streamJob = launch(…)`: the
+         setup shell itself;
+      2. indirect — a non-suspend entry that claims, then launches its setup,
+         and that setup calls a suspend tail which starts the stream
+         (`switchModelAndRerun` → `runRerunStreamTail`). Class 2 exists because
+         class 1 only sees shells that create `streamJob` inline.
+
+    In both cases the launch must be the RHS of an assignment to a field that
+    something reads (cancelStream's `sendShellJob?.cancel()`); a handle nobody
+    reads is as good as no handle.
+
+    A body whose `streamJob = launch(…)` has no enclosing `launch(` is a
     suspend continuation already running inside someone else's coroutine
-    (ChatQueueInterruption.resumeQueueAfterCancel / runRerunStreamTail), so
-    there is no shell to hold and nothing is reported.
+    (`runRerunStreamTail`), so there is no shell to hold.
     """
-    if rel != SHELL_SCOPE:
-        return []
-    out = []
-    shells = 0
-    sites = len(STREAM_JOB_ASSIGN_RE.findall(text))
-    for name, start, end, _is_suspend in iter_fun_bodies(text):
+    out, seen = [], set()
+
+    def judge(name, body, encl, opportunistic=False):
+        prefix = body[max(0, encl.start() - 96):encl.start()]
+        am = JOB_FIELD_ASSIGN_TAIL_RE.search(prefix)
+        line = text[:start_abs + encl.start()].count("\n") + 1
+        if line in seen:
+            return
+        seen.add(line)
+        if am is None:
+            if opportunistic:
+                # Deliberate: this coroutine claims the turn ITSELF and
+                # re-checks `if (_isStreaming.value)` first, so it only takes
+                # a free turn — the queue drain that exists BECAUSE a turn was
+                # cancelled (holding it would make Stop cancel the drain).
+                return
+            out.append(("C-B8b", rel, line,
+                        f"{name}(): the setup shell (the launch that leads to "
+                        "`streamJob`) is not stored in a job field — "
+                        "cancelStream() cannot reach it, so a Stop during "
+                        "setup still starts the stream. Assign it: "
+                        "`sendShellJob = viewModelScope.launch(…) { … }`."))
+            return
+        field = am.group(1)
+        if field not in field_reads:
+            out.append(("C-B8b", rel, line,
+                        f"{name}(): shell stored in `{field}` but nothing "
+                        "reads that field — an unreachable handle is no "
+                        "handle (cancelStream() must cancel it)."))
+
+    for name, start, end, is_suspend in iter_fun_bodies(text):
         body = text[start:end + 1]
+        start_abs = start
+        launches = list(LAUNCH_CALL_RE.finditer(body))
         for sj in STREAM_JOB_ASSIGN_RE.finditer(body):
             encl = None
-            for m in LAUNCH_CALL_RE.finditer(body, 0, sj.start()):
-                encl = m
-            if encl is None:
+            for m in launches:
+                if m.end() <= sj.start():
+                    encl = m
+            if encl is not None:
+                inside = [c for c in CLAIM_ON_RE.finditer(body)
+                          if encl.start() < c.start() < sj.start()]
+                opp = bool(inside) and bool(
+                    IN_FLIGHT_CHECK_RE.search(body[encl.start():inside[0].start()]))
+                judge(name, body, encl, opp)
+        if is_suspend or not tail_names:
+            continue
+        claims = list(CLAIM_ON_RE.finditer(body))
+        if not claims:
+            continue
+        for m in launches:
+            # The claim may sit before OR inside this launch (pre-fix
+            # switchModelAndRerun claimed after three DB round-trips): either
+            # way this coroutine is the turn's setup, so it needs a handle.
+            if not _depth0(text, start, start + m.start()):
+                continue  # nested lambda — not the entry's own shell
+            brace = body.find("{", m.end(), min(len(body), m.end() + 240))
+            if brace < 0:
                 continue
-            shells += 1
-            prefix = body[max(0, encl.start() - 96):encl.start()]
-            am = JOB_FIELD_ASSIGN_TAIL_RE.search(prefix)
-            line = text[:start + encl.start()].count("\n") + 1
-            if am is None:
-                out.append(("C-B8b", rel, line,
-                            f"{name}(): the setup shell (the launch that creates "
-                            "`streamJob`) is not stored in a job field — "
-                            "cancelStream() cannot reach it, so a Stop during "
-                            "setup still starts the stream. Assign it: "
-                            "`sendShellJob = viewModelScope.launch(…) { … }`."))
+            bend = match_brace(body, brace)
+            block = body[brace:(bend + 1) if bend else brace + 400]
+            if not any(re.search(r"\b" + re.escape(t) + r"\s*\(", block)
+                       for t in tail_names):
                 continue
-            field = am.group(1)
-            reads = [m for m in re.finditer(r"(?<![\w.])" + re.escape(field) + r"\b",
-                                            text)
-                     if not re.search(r"\b(?:val|var)\s+$",
-                                      text[max(0, m.start() - 8):m.start()])
-                     and text[m.end():m.end() + 12].lstrip()[:1] != "="]
-            if not reads:
-                out.append(("C-B8b", rel, line,
-                            f"{name}(): shell stored in `{field}` but nothing "
-                            "reads that field — an unreachable handle is no "
-                            "handle (cancelStream() must cancel it)."))
-    if not shells and not sites:
-        out.append(("C-B8b-ROT", rel, 1,
-                    "no `streamJob = launch(…)` assignment found in this file — "
-                    "the stream-job creation moved or was renamed. ROT — update "
-                    "this gate."))
+            judge(name, body, m)
     return out
 
 
+def stream_start_guard_findings(rel, text, raw_lines):
+    """[dv29-B01 C-B8c] No stream may start for a revoked claim.
+
+    Every `streamJob = launch(…)` site must be preceded, INSIDE the coroutine
+    that owns the site, by a bail-out comparing the identity the caller
+    captured against the live claim. Two exemptions, both semantic:
+
+      * a value that cannot have been revoked — the claim and the start sit in
+        one non-suspending block (see `_claim_then_atomic`);
+      * an audited `claim-ok: <reason>` marker on the site's line.
+
+    This is the cross-function half of the same decision: when the site lives
+    in a shared tail (`runRerunStreamTail`) the identity must be a PARAMETER,
+    because re-reading `streamingClaimEpoch` after the tail's own suspension
+    points compares the field with itself.
+    """
+    out = []
+    for name, start, end, _is_suspend in iter_fun_bodies(text):
+        body = text[start:end + 1]
+        params = _params_before(text, start)
+        for sj in STREAM_JOB_ASSIGN_RE.finditer(body):
+            site = start + sj.start()
+            anchor = _coroutine_anchor(text, start, site)
+            if _identity_guard(text, start, anchor, site, params):
+                continue
+            if _claim_then_atomic(text, anchor, site):
+                continue
+            line = text[:site].count("\n") + 1
+            if escaped(raw_lines, line, CLAIM_ESCAPE_RE):
+                continue
+            where = ("inside this coroutine" if anchor != start
+                     else "in this function")
+            out.append(("C-B8c", rel, line,
+                        f"{name}(): `streamJob =` starts a stream {where} "
+                        "with no claim-revocation guard. Stop (cancelStream) "
+                        "and a newer turn both revoke the claim while setup "
+                        "runs; compare the identity the CALLER captured "
+                        "(`if (sendEpoch != streamingClaimEpoch || claimToken "
+                        "!== streamingClaimToken) return`) and bail out. An "
+                        "identity captured in the same coroutine compares the "
+                        "field with itself (tautology) and never fires."))
+    return out
+
+
+
+def stream_tail_names(texts):
+    """Derived suspend tails: functions that create `streamJob` with no
+    enclosing `launch(` — they inherit the caller's coroutine, so the caller's
+    shell is the only cancellable handle (runRerunStreamTail)."""
+    names = set()
+    for text in texts:
+        for name, start, end, _is_suspend in iter_fun_bodies(text):
+            body = text[start:end + 1]
+            for sj in STREAM_JOB_ASSIGN_RE.finditer(body):
+                if not LAUNCH_CALL_RE.search(body, 0, sj.start()):
+                    names.add(name)
+    return names
 def enclosing_gate(clean_lines, idx, col, fake_gates=()):
     """First ownership condition enclosing the write, or None.
 
@@ -1381,7 +1631,10 @@ class ChatViewModel {
     var streamingClaimEpoch = 0
     var sendShellJob: Job? = null
     var streamJob: Job? = null
-    suspend fun drainQueue() {
+    suspend fun drainQueue(sendEpoch: Long, claimToken: Any) {
+        if (sendEpoch != streamingClaimEpoch || claimToken !== streamingClaimToken) {
+            return
+        }
         streamJob = launch(Dispatchers.IO) { work() }
         launch(Dispatchers.IO) { work() }
         streamingClaimToken = Any()
@@ -1450,6 +1703,137 @@ class ChatViewModel {
         POST_START,
         "if (termuxSession === session) {",
         "if (termuxSession == null) {")
+
+
+    # ── [dv29-B01] derived scope + revocation guard ──
+    # The dv29 B-01 defect lived in the SPLIT-OUT entry files, so the arms that
+    # matter sit OUTSIDE ChatViewModel.kt: if the scope ever regresses to a
+    # single hardcoded file, these trees go silent and the arms fail.
+    b8_ext = prefix + chat + "ChatRetryOps.kt"
+    b8_tail = prefix + chat + "ChatTurnPersistence.kt"
+    b8_indirect = prefix + chat + "ChatModelRouting.kt"
+
+    B8_EXT_POST = ("""package com.rikkaminis.app.ui.chat
+class ChatViewModel {
+    var streamingClaimToken: Any = Any()
+    var streamEpoch = 0L
+    var streamingClaimEpoch = 0L
+    var sendShellJob: Job? = null
+    var streamJob: Job? = null
+    fun cancelStream() { sendShellJob?.cancel() }
+    fun cleanup(): Int = 0
+    fun run() {}
+}
+internal fun ChatViewModel.retryLast() {
+    _isStreaming.value = true
+    streamEpoch++
+    streamingClaimEpoch = streamEpoch
+    val sendEpoch = streamingClaimEpoch
+    val claimToken = streamingClaimToken
+    sendShellJob = viewModelScope.launch(Dispatchers.IO) {
+        val cleaned = cleanup()
+        if (sendEpoch != streamingClaimEpoch || claimToken !== streamingClaimToken) {
+            return@launch
+        }
+        streamJob = launch(Dispatchers.IO) { run() }
+    }
+}
+""")
+    B8_EXT_NOSHELL = B8_EXT_POST.replace(
+        "    sendShellJob = viewModelScope.launch(Dispatchers.IO) {",
+        "    viewModelScope.launch(Dispatchers.IO) {")
+    B8_EXT_NOGUARD = B8_EXT_POST.replace(
+        """        if (sendEpoch != streamingClaimEpoch || claimToken !== streamingClaimToken) {
+            return@launch
+        }
+""", "")
+    B8_EXT_TAUTOLOGY = B8_EXT_POST.replace(
+        """        if (sendEpoch != streamingClaimEpoch || claimToken !== streamingClaimToken) {
+            return@launch
+        }""",
+        """        val e = streamingClaimEpoch
+        if (e != streamingClaimEpoch) {
+            return@launch
+        }""")
+
+    B8_TAIL_PRE = ("""package com.rikkaminis.app.ui.chat
+class ChatViewModel {
+    var streamingClaimToken: Any = Any()
+    var streamingClaimEpoch = 0L
+    var sendShellJob: Job? = null
+    var streamJob: Job? = null
+    fun cancelStream() { sendShellJob?.cancel() }
+    fun resync(): String = ""
+    fun run() {}
+}
+internal fun ChatViewModel.retryFromMessage() {
+    _isStreaming.value = true
+    streamingClaimEpoch = 1L
+    val sendEpoch = streamingClaimEpoch
+    val claimToken = streamingClaimToken
+    sendShellJob = viewModelScope.launch(Dispatchers.IO) {
+        val sid = resync()
+        runRerunStreamTail("retryFromMessage", sendEpoch, claimToken)
+    }
+}
+internal suspend fun ChatViewModel.runRerunStreamTail(
+    label: String,
+    sendEpoch: Long,
+    claimToken: Any,
+): Boolean {
+    val baseSystemPrompt = systemPromptForSession()
+    val launchEpoch = streamingClaimEpoch
+    streamJob = viewModelScope.launch(Dispatchers.IO) { run() }
+    return true
+}
+""")
+    B8_TAIL_POST = B8_TAIL_PRE.replace(
+        """    val launchEpoch = streamingClaimEpoch
+    streamJob = viewModelScope.launch(Dispatchers.IO) { run() }""",
+        """    val baseSystemPrompt2 = baseSystemPrompt
+    if (sendEpoch != streamingClaimEpoch || claimToken !== streamingClaimToken) {
+        return false
+    }
+    streamJob = viewModelScope.launch(Dispatchers.IO) { run() }""")
+
+    B8_INDIRECT_PRE = ("""package com.rikkaminis.app.ui.chat
+class ChatViewModel {
+    var streamingClaimToken: Any = Any()
+    var streamingClaimEpoch = 0L
+    var sendShellJob: Job? = null
+    var streamJob: Job? = null
+    fun cancelStream() { sendShellJob?.cancel() }
+    fun resync(): String = ""
+    fun run() {}
+}
+internal fun ChatViewModel.switchModelAndRerun(label: String) {
+    streamJob?.cancel()
+    val provider = currentProvider ?: return
+    streamingClaimToken = Any()
+    _isStreaming.value = true
+    streamingClaimEpoch = 1L
+    val switchEpoch = streamingClaimEpoch
+    val claimToken = streamingClaimToken
+    viewModelScope.launch(Dispatchers.IO) {
+        val sid = resync()
+        runRerunStreamTail(label, switchEpoch, claimToken)
+    }
+}
+internal suspend fun ChatViewModel.runRerunStreamTail(
+    label: String,
+    sendEpoch: Long,
+    claimToken: Any,
+): Boolean {
+    if (sendEpoch != streamingClaimEpoch || claimToken !== streamingClaimToken) {
+        return false
+    }
+    streamJob = viewModelScope.launch(Dispatchers.IO) { run() }
+    return true
+}
+""")
+    B8_INDIRECT_POST = B8_INDIRECT_PRE.replace(
+        "    viewModelScope.launch(Dispatchers.IO) {\n        val sid = resync()",
+        "    sendShellJob = viewModelScope.launch(Dispatchers.IO) {\n        val sid = resync()")
 
     def mk_tree(files):
         root = tempfile.mkdtemp(prefix="claim-release-selftest-")
@@ -1535,6 +1919,25 @@ class ChatViewModel {
          {b8_path: B8_ROT_CLAIM}, 1, ["C-B8-ROT"]),
         ("1048-B08 ROT: the stream-job assignment vanished",
          {b8_path: B8_ROT_STREAMJOB}, 1, ["C-B8b-ROT"]),
+        # ── [dv29-B01] derived scope + revocation guard ──
+        ("dv29-B01 derived scope: split-out entry file is scanned (C-B8b)",
+         {b8_ext: B8_EXT_NOSHELL}, 1,
+         ["[C-B8b]", "ChatRetryOps.kt", "is not stored in a job field"]),
+        ("dv29-B01 derived scope: the fixed extension entry is green",
+         {b8_ext: B8_EXT_POST}, 0, []),
+        ("dv29-B01 mutation: revocation guard deleted (C-B8c)",
+         {b8_ext: B8_EXT_NOGUARD}, 1, ["[C-B8c]", "no claim-revocation guard"]),
+        ("dv29-B01 mutation: guard becomes a self-comparison (C-B8c)",
+         {b8_ext: B8_EXT_TAUTOLOGY}, 1, ["[C-B8c]", "tautology"]),
+        ("dv29-B01 cross-function tail re-reads the claim (C-B8c)",
+         {b8_tail: B8_TAIL_PRE}, 1, ["[C-B8c]", "tautology"]),
+        ("dv29-B01 cross-function tail takes the caller's identity (green)",
+         {b8_tail: B8_TAIL_POST}, 0, []),
+        ("dv29-B01 indirect shell: setup calling the tail must be held (C-B8b)",
+         {b8_indirect: B8_INDIRECT_PRE}, 1,
+         ["[C-B8b]", "ChatModelRouting.kt", "is not stored in a job field"]),
+        ("dv29-B01 indirect shell held is green",
+         {b8_indirect: B8_INDIRECT_POST}, 0, []),
         ("1044-A02 mutation: guard on `== null` instead of identity is caught",
          {post_start: MUT_WRONG_PREDICATE}, 1,
          ["termuxSession slot clear inside a preemption bail-out without an "
@@ -1635,14 +2038,48 @@ def main():
             start_preemption_findings(rel, clean[rel],
                                       fake_gates.get(rel, ())))
 
-    # ── Check C-B8 / C-B8b: claim timing + setup-shell ownership ([1048-B08]) ──
-    findings_b8, findings_b8b = [], []
-    if SHELL_SCOPE in clean:
-        shell_text = "\n".join(clean[SHELL_SCOPE])
-        findings_b8 = synchronous_claim_findings(
-            SHELL_SCOPE, shell_text, rawD[SHELL_SCOPE])
-        findings_b8b = unheld_shell_findings(
-            SHELL_SCOPE, shell_text, rawD[SHELL_SCOPE])
+    # ── Check C-B8 / C-B8b / C-B8c: claim timing + shell ownership +
+    #    revocation guard ([1048-B08] / [dv29-B01]) ──
+    findings_b8, findings_b8b, findings_b8c = [], [], []
+    scope = derived_scope(clean)
+    scope_texts = ["\n".join(clean[rel]) for rel in scope]
+    # Scope ROT is keyed to the flag family, not to a hardcoded filename: the
+    # gate loses its subject when chat files still mention `_isStreaming` but
+    # none carries a claim write or a stream-job creation. Trees without those
+    # files (unit fixtures, partial checkouts) are not a regression signal.
+    flag_files = [rel for rel in clean if SHELL_DIR_RE.match(rel)
+                  and "_isStreaming" in "\n".join(clean[rel])]
+    if flag_files and not scope:
+        findings_b8.append((
+            "C-B8-SCOPE-ROT", flag_files[0], 1,
+            "the `ui/chat` files still mention `_isStreaming` but none carries "
+            "a claim write or a `streamJob =` creation — the naming this gate "
+            "derives its scope from changed. ROT — update this gate (the "
+            "subject list must stay derived)."))
+    shares = job_field_reads(scope_texts)
+    tails = stream_tail_names(scope_texts)
+    if scope and not any(CLAIM_ON_RE.search(t) for t in scope_texts):
+        findings_b8.append((
+            "C-B8-ROT", scope[0], 1,
+            "no function body in scope writes `_isStreaming.value = true` — "
+            "the claim was renamed or moved out. ROT — update this gate."))
+    # The stream-creation ROT needs a positive signal that a stream job IS
+    # created somewhere: an entry that stores a launch in a job field is that
+    # signal. A claim-only tree (the `claim-ok` escape-hatch shape) is not a
+    # rename — it simply starts no stream.
+    if (scope and any(CLAIM_ON_RE.search(t) for t in scope_texts)
+            and any(JOB_ASSIGN_ANY_RE.search(t) for t in scope_texts)
+            and not any(STREAM_JOB_ASSIGN_RE.search(t) for t in scope_texts)):
+        findings_b8b.append((
+            "C-B8b-ROT", scope[0], 1,
+            "an entry stores its setup launch in a job field but no "
+            "`streamJob = launch(…)` assignment exists in scope — the "
+            "stream-job creation moved or was renamed. ROT — update this gate."))
+    for rel, text in zip(scope, scope_texts):
+        findings_b8.extend(synchronous_claim_findings(rel, text, rawD[rel]))
+        findings_b8b.extend(
+            unheld_shell_findings(rel, text, rawD[rel], shares, tails))
+        findings_b8c.extend(stream_start_guard_findings(rel, text, rawD[rel]))
 
     minted_names = {m["var"] for m in mints}
 
@@ -1669,7 +2106,7 @@ def main():
 
     total = (len(findings_a) + len(findings_b) + len(findings_c1)
              + len(findings_c3) + len(findings_b8) + len(findings_b8b)
-             + len(c2_reports))
+             + len(findings_b8c) + len(c2_reports))
     if not total:
         print("✅ Claim/release guard: no ungated release, self-bound gate, "
               "unguarded settlement or unminted claim found")
@@ -1723,10 +2160,17 @@ def main():
             print(f"     [{kind}] {rel}:{ln}  {msg}")
     if findings_b8b:
         print("   [C-B8b] Setup shell not held (1048-B08):")
-        print("       the launch that creates `streamJob` must be stored in a job")
+        print("       the launch that leads to `streamJob` must be stored in a job")
         print("       field that cancelStream() actually reads (sendShellJob), or")
         print("       a Stop during setup still starts the stream.")
         for kind, rel, ln, msg in findings_b8b:
+            print(f"     [{kind}] {rel}:{ln}  {msg}")
+    if findings_b8c:
+        print("   [C-B8c] Stream starts without a claim-revocation guard (dv29-B01):")
+        print("       the claim can be revoked (Stop / newer turn) while the setup")
+        print("       is suspended; the site must compare the identity the caller")
+        print("       captured and bail out first.")
+        for kind, rel, ln, msg in findings_b8c:
             print(f"     [{kind}] {rel}:{ln}  {msg}")
     if findings_b:
         print("   [B] Claim flips the flag before publishing the release gate's marker.")
