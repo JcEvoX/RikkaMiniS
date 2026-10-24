@@ -12,6 +12,7 @@
 | 分支 CI | run **#2602** / id `40069749029` / job `120800435130`，head_sha `828ff4ee50aaf5c97915e506867781eb0b2c88d4`（本地 / `ls-remote` / `run.head_sha` 三方逐字符一致），event=workflow_dispatch，attempt **1**，conclusion **success** |
 | 过程数据点 | run #2598 / id `40068328497` @ `ef9edc06` 亦 success（提交 1 的独立验证，非最终判据） |
 | 门 / 夹具 | 门 **111 不变**（0 新建门，扩 `truncated_call_guard_check.py` 的 4 条新判据 + 4 条新 selftest 臂：17 → 21）；夹具 **342 不变**（`scan.sh` / `test_scan.py` 零触碰，夹具只断 `TRUNCATED_CALL_GUARD_SELFTEST=PASS` 标记，本支保留） |
+| 源码树等价 | 报告回填提交只含 `fix-reports/dv29-FIX-A1.md`；`git diff --name-only 828ff4ee… HEAD -- . ':(exclude)fix-reports'` **输出为空** ⇒ 当前 HEAD 的源码树与 CI 验证树逐字节一致（对本报告所在提交同样成立） |
 
 改动规模：`git diff --stat main...HEAD` 见 §8 末尾实测输出（4 文件：2 生产 / 1 测试 / 1 门）。
 
