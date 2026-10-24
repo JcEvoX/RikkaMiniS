@@ -127,6 +127,10 @@
 - **D1（重要）**：票据 §2 写「`ImageBudget.kt:110` 属另一族：先证它是否已判返回值」并暗示它合规。真树取证：PRE2 臂 2 条违规（`:110 [B2]` 丢弃判定、`:80 [B3]` helper 无法表达失败）⇒ 它**同样**丢弃判定，票据的「可能已合规」前提不成立。按票据不动，`record-ok:` 明写属于半径外 + 登记 R2。**判据：`record-ok` 不是「这处没问题」，是「这处有问题但不在本条半径」**——两者在门里同形，区别只在理由文本。
 - **D2（我自己踩的）**：`mutate_real.py` 首版用 subprocess，沙箱在 waitpid 中途 `exit -1` ⇒**生产文件停在变异态**，下一次扫描把污染态当基线存下来（`REFUSING: the tree is not green before mutating (1 B2 / 1 B3)`）。改为**纯进程内**（只做字节读写 + 直接 import 门模块）后 8 臂稳定。**规程来源**：变异驱动必须自带「变异前树必须绿」的断言 + 每次 arm 后立即还原，不能靠 arm 之间共享状态。
 - **D3（票据措辞）**：票据表格把 `ChatPromptAndTools.kt:754` 标为「`resizeImageBytes`? 见下」并自注不确定；真树：`:754` 是 **`resizeJpegToMaxEdge`**，`:1536` 是 **`resizeImageBytes`**（两者都被 PRE 臂按真树函数名报出）。行号与函数名以真树为准。
+- **D4（判读装置自伤，两条 needle + 一条对齐，全部当场闭环）**：
+  ①`Summary: 111 passed, 0 failed` 的判据不能写「日志里的 Summary 行集合 == 该行」——日志另有 7 条按测试组统计的 Summary（`25/5/13/33/10/22/10 passed, 0 failed`），正确判据是**111/0 出现次数恰为 1 且所有 Summary 行 failed==0**。
+  ②`--self-test` 的**原始 stdout 不进 CI 日志**（`test_scan` 只在断言行打印注册标记），所以「`encode-verdict self-test has teeth`」在日志里恒 0 命中 —— 这不是「新臂没跑」，是 needle 选错了层。新臂的 CI 见证 = 注册行 + `--self-test` 返回 0（encode 段返回 rc6 参与返回码串联，臂红必使夹具红）。此坑 1042-C6 已记，本轮换了个门又踩一次 ⇒ **判据要挑「CI 里真的会被打印的那一层」**。
+  ③警告比对必须按（文件名, 警告文本），**不能按行号**：首版按行号比对报 4 条「新增」，逐条看全是同一批警告的漂移（`BrowserUseManager:151→152`、`:152→153`、`AccessibilityOffloadHandler:1157→1165`、`PhotosOffloadHandler:1213→1222`），按文本对齐后 **新增 0 / 减少 0**。与 1047 并集阶段的同一条结论互为复现。
 
 **残留（backlog §1048-A2）**
 - **R1 真机欠账**：构造编码失败（极小内存 / 不可写目录 / insert 后写入失败），验证①相册导出答失败且不留 0 字节文件 ②a11y 截图返回 `ENCODE_FAILED` 而非 `success=true` 空载荷 ③`read_image` 报错 ④浏览器截图报错且不带空 `imageFilePath` ⑤chat 预览回落到原图。**触发条件**：下次真机窗口或用户报告「相册里有打不开的图片 / 模型说看不到图但工具成功」。
@@ -144,11 +148,19 @@
 | 基线 main | `eea9f407f9e0e79f4902eeef1f84e1550ee5c29c` |
 | 分支 | `fix/dv28-a2-compress-verdict` |
 | 代码提交 | `a8ae907d`（9 文件 +468/−15：生产 5 / record-ok 3 / 门 1） |
-| 报告提交 | 本文件（仅 `fix-reports/`，源码树等价声明见下） |
-| CI run / job | 待回填（绿后本节追加 head_sha 三方核对） |
+| 报告提交 | `44d11704`（仅 `fix-reports/dv28-FIX-A2.md`） |
+| CI run | **`40051049467`** / `#2589` / attempt 1 / event `workflow_dispatch` / conclusion **success** |
+| CI job | **`120743586851`**（26 步，`bad=[]`，唯一 skipped = `Publish to Releases` = main 门控） |
+| head_sha 三方 | run `44d117048ee3731020d3eed1485a64de934d6451` == 本地 HEAD == `git ls-remote origin` 逐字符一致 |
 
-源码树等价声明格式（报告回填后使用）：
-`git diff --name-only <绿sha>..HEAD -- . ':(exclude)fix-reports'` 输出为空 ⇒ CI 结论对当前代码树成立。
+**CI 日志判读（`probe/ci/job.log`，1,456,245 B，装置 `probe/ci/verify_ci.py`）**：
+- `Summary: 111 passed, 0 failed` 恰一条（日志另有 7 条按测试组统计的 Summary 行，全为 `0 failed`；判据只认 111/0 的出现次数为 1）；
+- `ALL 342 CASES PASS` ×1；`discarded_return_guard selftest has teeth (binary-write self-test has teeth)` ×1；`discarded_return_guard real tree green` ×1；`encode verdict section green` ×1；
+- Kotlin 编译错 0；游离 `FAILED` 行 0（含 FAILED 的行逐条确认都是 PASSED 用例名子串）；
+- **本支改过的 8 个文件编译警告：按（文件名, 警告文本）与 main 基线对齐后 新增 0**（基线 4 / 本支 4，逐条同文；首版按行号比对报出 4 条「新增」，实为行号漂移：`BrowserUseManager:151→152`、`:152→153`、`AccessibilityOffloadHandler:1157→1165`、`PhotosOffloadHandler:1213→1222`）。
+- 装置自伤（见 §6 D4）：首版把「selftest 原始 stdout 里的 `encode-verdict self-test has teeth`」当 CI 判据，但 `test_scan` 只在断言行打印注册标记、**不转发门自身的 stdout**（1042-C6 已记），故该 needle 恒 0。正确见证 = 注册行 + `--self-test` 返回 0（我的 encode 段返回 rc6 参与串联 ⇒ 臂失败必使夹具红）。
+
+源码树等价声明：本 §7 回填仅触及 `fix-reports/`，`git diff --name-only 44d11704..HEAD -- . ':(exclude)fix-reports'` 输出为空 ⇒ CI 结论对当前代码树成立。
 
 ---
 
