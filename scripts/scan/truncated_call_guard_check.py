@@ -59,6 +59,9 @@ ANTHROPIC = MAIN + "/provider/anthropic/AnthropicProvider.kt"
 TOOL_EXECUTORS = MAIN + "/ui/chat/ChatToolExecutors.kt"
 GEMINI = MAIN + "/provider/gemini/GeminiProvider.kt"
 SIGNALS = MAIN + "/provider/openai/OpenAiStreamSignals.kt"
+# [dv29 A-01] Anthropic's tool-lifecycle activity weights — the single home of
+# "does this SSE event prove the turn produced tool-call progress".
+ANTHROPIC_SIGNALS = MAIN + "/provider/anthropic/AnthropicStreamSignals.kt"
 
 C1_SIGNATURE = ("fun rejectionReason(toolName: String, finishReason: String?, "
                 "turnTruncated: Boolean = false): String?")
@@ -99,6 +102,20 @@ C8_COUNTER_VISIBILITY = 2       # distinct feed sites of the guard's counter
 C8_ERROR_STATUS_TOKEN = "429"   # the family the status derivation must produce
 C8_ERROR_TRANSIENT_TOKEN = "500"
 
+# [dv29 A-01] Anthropic's three tool-lifecycle arms must ALL feed the EOF
+# guard's tool counter, and they must do it through the pure weights in
+# AnthropicStreamSignals.kt. Nothing below is pinned by symbol name: the arms
+# are located by their protocol labels, the counter is read out of the pinned
+# EOF guard, and the weights are whatever pure Int functions that module
+# declares. Renaming keeps the gate working; dropping a feed does not.
+ANTHROPIC_LIFECYCLE_LABELS = [
+    '"content_block_start" ->',
+    '"content_block_delta" ->',
+    '"content_block_stop" ->',
+    '"message_delta" ->',   # terminator of the stop arm, not a judged arm
+]
+ANTHROPIC_TOOL_USE_TOKEN = '"tool_use"'
+
 # Structural anchors for the selftest arms below. They name the SHAPE of the
 # fix, so a rewrite of the fix must update them — that is deliberate: an arm
 # that silently stops mutating anything would report a false green.
@@ -119,6 +136,16 @@ RESPONSES_STATUS_CALL = """mapHttpError(
 
 ESCAPE = "truncated-guard-ok:"
 SELFTEST_MARK = "TRUNCATED_CALL_GUARD_SELFTEST=PASS"
+
+# [dv29 A-01] Mutators for the Anthropic feed arms. These are NOT criteria —
+# they exist so the arms below can dirty the tree in the shape a regression
+# would take. The criteria themselves derive everything from structure.
+ANTHROPIC_START_ANCHOR = 'val contentBlock = event.optJSONObject("content_block")'
+ANTHROPIC_START_FEED = ("toolChars += toolUseStartActivityChars("
+                        "currentToolId!!, currentToolName!!)")
+ANTHROPIC_STOP_FEED = ("toolChars += toolUseStopActivityChars("
+                       "currentToolId!!, currentToolName!!)")
+ANTHROPIC_DELTA_FEED = "toolChars += toolInputDeltaActivityChars(partial)"
 
 
 def strip_kotlin_comments(text):
@@ -192,7 +219,8 @@ def line_of_regex(text, pattern):
 
 
 def load(root):
-    paths = [POLICY, ENGINE, OPENAI, ANTHROPIC, TOOL_EXECUTORS, GEMINI, SIGNALS]
+    paths = [POLICY, ENGINE, OPENAI, ANTHROPIC, TOOL_EXECUTORS, GEMINI, SIGNALS,
+             ANTHROPIC_SIGNALS]
     texts = []
     for rel in paths:
         path = os.path.join(root, rel)
@@ -217,7 +245,57 @@ def escaped_segment(text, needle):
     return False
 
 
-def check(policy, engine, openai, anthropic, tool_executors, gemini, signals):
+def anthropic_lifecycle_branches(code):
+    """{label: body slice} for the three tool-lifecycle arms of the Anthropic
+    SSE `when (eventType)`.
+
+    Sliced by SIBLING PROTOCOL LABELS, never by brace pairing: the arms carry
+    lambdas and strings that defeat naive brace matching, and a reformatted or
+    reordered `when` must not blind the criteria. Comments must already be
+    stripped by the caller (the fix's own KDoc names every label).
+    """
+    pos = [code.find(label) for label in ANTHROPIC_LIFECYCLE_LABELS]
+    if any(p < 0 for p in pos):
+        return None
+    return {ANTHROPIC_LIFECYCLE_LABELS[i]: code[pos[i]:pos[i + 1]]
+            for i in range(len(ANTHROPIC_LIFECYCLE_LABELS) - 1)}
+
+
+def counter_writes(text, counter):
+    """Every `counter += …` / `counter = …` site (never `==`)."""
+    return [m.start() for m in
+            re.finditer(r"\b%s\b\s*\+?=(?!=)" % re.escape(counter), text)]
+
+
+def anthropic_tool_counter(anth):
+    """The EOF guard's TOOL counter, derived rather than pinned.
+
+    The guard compares two counters against zero; the tool one is the counter
+    actually written inside a tool-lifecycle arm. Any surviving feed identifies
+    it, so deleting ONE feed still lets the other two criteria be judged (the
+    deleted one reports red) instead of collapsing into a name-not-found.
+    """
+    counters = []
+    for name in re.findall(r"([A-Za-z_]\w*)\s*>\s*0\b", C3_ANTHROPIC_GUARD):
+        if name not in counters:
+            counters.append(name)
+    branches = anthropic_lifecycle_branches(anth) or {}
+    delta = branches.get('"content_block_delta" ->', "")
+    inner = delta.find('"input_json_delta" ->')
+    regions = []
+    if inner >= 0:
+        regions.append(delta[inner:])
+    regions.append(branches.get('"content_block_stop" ->', ""))
+    regions.append(branches.get('"content_block_start" ->', ""))
+    for region in regions:
+        for name in counters:
+            if counter_writes(region, name):
+                return name
+    return counters[-1] if counters else None
+
+
+def check(policy, engine, openai, anthropic, tool_executors, gemini, signals,
+          anthropic_signals):
     """Return [(criterion, file, line, message)] — empty list means wired."""
     problems = []
 
@@ -448,6 +526,125 @@ def check(policy, engine, openai, anthropic, tool_executors, gemini, signals):
                     "openai-stream-error-single-source", OPENAI, 0,
                     "the Responses terminal-failure arm is gone"))
 
+    # ------------------------------------------------------------------
+    # C10 — [dv29 A-01] Anthropic's EOF guard counts tool-call activity, so
+    # EVERY tool-lifecycle arm has to feed that counter. It used to be fed by
+    # the argument deltas alone: a pure-tool turn (contentChars == 0) cut
+    # between the `tool_use` block announcement and the first non-empty delta
+    # therefore looked like a completely empty stream, the orphan flush sent
+    # `ToolCallComplete(id, name, {})`, and `turnTruncated` stayed false so the
+    # executor ran an argument-less call. The Gemini and OpenAI arms of this
+    # same family already had this shape (C6/C8) — this is the sibling that was
+    # only PINNED, never checked.
+    #
+    # All four criteria are derived: the arms come from the protocol labels,
+    # the counter is read out of the pinned guard, the weights are whatever
+    # pure Int functions the signals module declares. Renaming keeps the gate
+    # working; dropping a feed, or feeding a non-tool block header, does not.
+    # ------------------------------------------------------------------
+    anth_code = strip_kotlin_comments(anthropic)
+    anth_sig_code = strip_kotlin_comments(anthropic_signals)
+    anth_escapable = ESCAPE in anth_sig_code
+    if (not anth_escapable) and anth_code.count(C3_ANTHROPIC_GUARD) == 1:
+        tool_counter = anthropic_tool_counter(anth_code)
+        branches = anthropic_lifecycle_branches(anth_code)
+        if branches is None:
+            problems.append((
+                "anthropic-tool-lifecycle-branches", ANTHROPIC,
+                line_of(anth_code, '"content_block_start" ->'),
+                "the SSE lifecycle arms (%s) cannot be located — a reordered or "
+                "renamed `when (eventType)` would blind the feed criteria below"
+                % ", ".join(ANTHROPIC_LIFECYCLE_LABELS)))
+        elif tool_counter is not None:
+            start = branches['"content_block_start" ->']
+            stop = branches['"content_block_stop" ->']
+            delta = branches['"content_block_delta" ->']
+
+            # (a) the block announcement is already progress, but ONLY inside
+            #     the tool_use guard: counting a text/thinking block header
+            #     would steal the fully-empty case from
+            #     failOnSilentEmptyCompletion.
+            token_at = start.find(ANTHROPIC_TOOL_USE_TOKEN)
+            if token_at < 0:
+                problems.append((
+                    "anthropic-tool-start-feeds-counter", ANTHROPIC,
+                    line_of(anth_code, '"content_block_start" ->'),
+                    "the content_block_start arm no longer tests %s — the tool block "
+                    "announcement cannot feed '%s' any more"
+                    % (ANTHROPIC_TOOL_USE_TOKEN, tool_counter)))
+            else:
+                close = start.find(")", token_at)
+                body_open = start.find("{", close) if close >= 0 else -1
+                writes = counter_writes(start, tool_counter)
+                guarded = [w for w in writes
+                           if body_open >= 0 and w > body_open
+                           and "{" not in start[body_open + 1:w]
+                           and "}" not in start[body_open + 1:w]]
+                if not guarded:
+                    problems.append((
+                        "anthropic-tool-start-feeds-counter", ANTHROPIC,
+                        line_of(anth_code, '"content_block_start" ->'),
+                        "the tool_use block announcement must feed '%s' (%s) — a "
+                        "pure-tool turn cut before its first argument delta would "
+                        "otherwise read as an empty stream, and the orphan flush "
+                        "would hand an argument-less call to the executor%s"
+                        % (tool_counter, ", ".join(
+                            ["%s += <weight>()" % tool_counter]),
+                           "" if not writes else "; it is written OUTSIDE the "
+                           "tool_use guard, so a text/thinking block header would "
+                           "be counted as tool activity")))
+
+            # (b) the block completion is progress too: a zero-argument call
+            #     that finished streaming still must be flagged when the stream
+            #     dies before message_delta.
+            if not counter_writes(stop, tool_counter):
+                problems.append((
+                    "anthropic-tool-stop-feeds-counter", ANTHROPIC,
+                    line_of(anth_code, '"content_block_stop" ->'),
+                    "the content_block_stop arm completes a tool call but never "
+                    "feeds '%s' — a zero-argument call cut before message_delta "
+                    "survives as a clean no-finish EOF" % tool_counter))
+
+            # (c) regression guard on the one feed that always existed.
+            if not counter_writes(delta, tool_counter):
+                problems.append((
+                    "anthropic-tool-delta-feeds-counter", ANTHROPIC,
+                    line_of(anth_code, '"content_block_delta" ->'),
+                    "the content_block_delta arm no longer feeds '%s' — the "
+                    "pre-existing mid-argument truncation signal is gone"
+                    % tool_counter))
+
+            # (d) single source: every feed goes through a pure weight declared
+            #     in the signals module, and every declared weight is used.
+            declared = top_level_int_funs(anth_sig_code)
+            callees = set(re.findall(
+                r"\b%s\b\s*\+=\s*([A-Za-z_]\w*)\s*\(" % re.escape(tool_counter),
+                anth_code))
+            if not callees:
+                problems.append((
+                    "anthropic-tool-weights-single-source", ANTHROPIC,
+                    line_of(anth_code, "[RC2-truncated-detection]"),
+                    "'%s' is fed by raw arithmetic instead of the pure weights in "
+                    "AnthropicStreamSignals — the decision table is then untestable "
+                    "and each arm can drift" % tool_counter))
+            else:
+                missing = sorted(set(declared) - callees)
+                extra = sorted(callees - set(declared))
+                if missing:
+                    problems.append((
+                        "anthropic-tool-weights-single-source", ANTHROPIC,
+                        line_of(anth_code, "[RC2-truncated-detection]"),
+                        "these weights are declared in AnthropicStreamSignals but never "
+                        "fed into '%s': %s — a lifecycle arm lost its wire-up"
+                        % (tool_counter, ", ".join(missing))))
+                if extra:
+                    problems.append((
+                        "anthropic-tool-weights-single-source", ANTHROPIC,
+                        line_of(anth_code, "[RC2-truncated-detection]"),
+                        "'%s' is fed through functions that AnthropicStreamSignals does "
+                        "not declare (%s) — the derivation is no longer single-source"
+                        % (tool_counter, ", ".join(extra))))
+
     return problems
 
 
@@ -455,7 +652,8 @@ def selftest(root):
     files = load(root)
     if files is None:
         return 1
-    policy, engine, openai, anthropic, tool_executors, gemini, signals = files
+    policy, engine, openai, anthropic, tool_executors, gemini, signals, \
+        anthropic_signals = files
 
     def on(i, fn):
         # Positional mutator: load() returns 7 texts, and the arms must keep
@@ -539,6 +737,28 @@ def selftest(root):
              '                                throw LLMError.TransientError("[$code] $message")\n'
              '                            }\n'
              '                            throw LLMError.ProviderError("[$code] $message")', 1))),
+        # ---- [dv29 A-01] Anthropic tool-lifecycle feed arms --------------
+        # Expectations are hand-written from the criterion table above: an arm
+        # that silently stops mutating anything must show up as "expected X got
+        # ()" instead of a false green.
+        ("anthropic block announcement stops feeding the tool counter",
+         "anthropic-tool-start-feeds-counter+anthropic-tool-weights-single-source",
+         on(3, lambda s: s.replace(ANTHROPIC_START_FEED, "", 1))),
+        ("anthropic block completion stops feeding the tool counter",
+         "anthropic-tool-stop-feeds-counter+anthropic-tool-weights-single-source",
+         on(3, lambda s: s.replace(ANTHROPIC_STOP_FEED, "", 1))),
+        ("anthropic announcement feed moves outside the tool_use guard",
+         "anthropic-tool-start-feeds-counter",
+         on(3, lambda s: s.replace(
+             ANTHROPIC_START_ANCHOR,
+             'val contentBlock = event.optJSONObject("content_block")\n'
+             '                        toolChars += toolUseStartActivityChars("", "")\n'
+             '                        if (contentBlock?.safeOptString("type", "") == "tool_use") {',
+             1).replace(ANTHROPIC_START_FEED + "\n", "", 1))),
+        ("anthropic argument feed reverts to raw arithmetic",
+         "anthropic-tool-weights-single-source",
+         on(3, lambda s: s.replace(ANTHROPIC_DELTA_FEED,
+                                        "toolChars += partial.length", 1))),
     ]
 
     failed = []
