@@ -23,7 +23,12 @@ This gate pins, on the comment-stripped source:
   * `destroy()` wakes BOTH waiters (`navigationDeferred?.complete(` and
     `asyncJsSlot.takeCurrent()`);
   * `onRendererGone` wakes the async-JS waiter too;
-  * `AsyncJsSlot.takeCurrent()` still exists (the teardown entry point);
+  * `AsyncJsSlot.takeCurrent()` still *takes* — [meta-audit-1024 anchor] the
+    criterion used to be the declaration substring `"fun takeCurrent()"`, so
+    the external witness rewrote the body to `return null` and the gate stayed
+    green while every teardown wake-up became a no-op (the 1019 ISSUE-08 stall
+    again). The body must now read the slot, clear it (`entry = null`) AND
+    return the taken value; an unextractable body is RED (fail-closed);
   * EVERY `URLDecoder.decode(` call site under src/android/app/src/main/java
     carries the `.replace("+", "%2B")` escape inside a +/- window (no
     allowlist: the two pre-existing call sites already comply, so any new
@@ -64,7 +69,18 @@ DESTROY_MUST = (
 RENDERER_MUST = (
     ("onRendererGone does not wake the async-JS waiter", "asyncJsSlot.takeCurrent()"),
 )
+# [meta-audit-1024 anchor] `SLOT_MUST` was a declaration-shaped anchor: the
+# witness rewrote the body to `return null` and the gate stayed green. The three
+# regexes below are the EFFECT the teardown path depends on. `SLOT_MUST` is kept
+# for the KDoc cross-reference only — it is no longer a criterion by itself.
 SLOT_MUST = "fun takeCurrent()"
+# reads the slot: any `entry` occurrence that is not a plain assignment target
+# (`entry = …`); `entry == x` / `entry?.value` / `val current = entry` all count.
+SLOT_READ_RE = re.compile(r"\bentry\b(?!\s*=(?!=))")
+# clears it: the take must hand the entry out exactly once.
+SLOT_CLEAR_RE = re.compile(r"\bentry\s*=\s*null\b")
+# returns what it read — the deferred the teardown is about to complete.
+SLOT_RETURN_RE = re.compile(r"return\s+[\w?.]+\s*\.value\b")
 
 # ── [deep-audit-1045 B-02] WebView lifecycle contract ────────────────────────
 # Decision points, not spellings: a View-queue post on the manager's own
@@ -581,12 +597,48 @@ def url_decode_violations(root):
 
 
 def analyse_slot(slot_src):
+    """[meta-audit-1024 anchor] The teardown take must still *take*.
+
+    The old criterion was the substring `"fun takeCurrent()"` on the
+    comment-stripped file — a declaration-shaped anchor. The external witness
+    rewrote the body to `return null` (never touching the declaration) and the
+    gate stayed green, while `destroy()` / `onRendererGone`'s
+    `takeCurrent()?.complete(…)` became a no-op and every in-flight
+    `executeJS()` / `fetch()` waiter burned its full 30s/60s timeout after a
+    tab teardown or a renderer crash (deep-audit-1019 ISSUE-08 again).
+
+    The decision point is the EFFECT, so all three of these must hold inside the
+    body of `takeCurrent`:
+      1. it reads the slot (`val current = entry ?: return null` or any read of
+         `entry`);
+      2. it CLEARS the slot (`entry = null`) — a take that leaves the entry in
+         place hands the same deferred out on the next teardown;
+      3. it returns what it read (`return current.value`, or `return entry.value`
+         in a body that captured it first).
+    A body that cannot be extracted is RED (fail-closed), never a silent pass.
+    """
     doc = strip_comments(slot_src)
-    return [(
-        "AsyncJsSlot.takeCurrent() teardown entry point is gone",
-        SLOT_MUST in doc,
-        "AsyncJsSlot.kt",
-    )]
+    body = function_body(doc, "takeCurrent")
+    if body is None:
+        return [
+            ("AsyncJsSlot.takeCurrent() teardown entry point is gone",
+             False, "AsyncJsSlot.kt"),
+            ("AsyncJsSlot.takeCurrent() no longer reads the slot",
+             False, "AsyncJsSlot.kt"),
+            ("AsyncJsSlot.takeCurrent() no longer clears the slot",
+             False, "AsyncJsSlot.kt"),
+            ("AsyncJsSlot.takeCurrent() no longer returns the taken value",
+             False, "AsyncJsSlot.kt"),
+        ]
+    return [
+        ("AsyncJsSlot.takeCurrent() teardown entry point is gone", True, "AsyncJsSlot.kt"),
+        ("AsyncJsSlot.takeCurrent() no longer reads the slot",
+         bool(SLOT_READ_RE.search(body)), "AsyncJsSlot.kt"),
+        ("AsyncJsSlot.takeCurrent() no longer clears the slot",
+         bool(SLOT_CLEAR_RE.search(body)), "AsyncJsSlot.kt"),
+        ("AsyncJsSlot.takeCurrent() no longer returns the taken value",
+         bool(SLOT_RETURN_RE.search(body)), "AsyncJsSlot.kt"),
+    ]
 
 
 # --- fixtures ----------------------------------------------------------------
@@ -823,9 +875,95 @@ def selftest():
         True,
     )
 
-    # 7: slot entry point.
-    expect("clean fixture: takeCurrent present", analyse_slot("fun takeCurrent(): T? { return null }")[0][1], True)
-    expect("breaker: takeCurrent removed", analyse_slot("fun finish(): Boolean { return false }")[0][1], False)
+    # 7: slot teardown take — [meta-audit-1024 anchor] the BODY, not the
+    # declaration. `SLOT_MUST` used to be the whole criterion; the witness
+    # (body -> `return null`) kept it true while the teardown wake-up became a
+    # no-op. Every arm below states its expected red set up front.
+    def slot_reds(src):
+        return [c for c, ok, _ in analyse_slot(src) if not ok]
+
+    def slot_expect(label, src, want):
+        got = slot_reds(src)
+        ok = len(got) == len(want) and all(any(w in c for c in got) for w in want)
+        expect("%s -> red set %s" % (label, got or "[]"), ok, True)
+
+    GOOD_SLOT = (
+        "internal class AsyncJsSlot<T : Any> {\n"
+        "    @Volatile\n"
+        "    private var entry: Entry<T>? = null\n"
+        "    fun takeCurrent(): T? {\n"
+        "        val current = entry ?: return null\n"
+        "        entry = null\n"
+        "        return current.value\n"
+        "    }\n"
+        "}\n"
+    )
+    slot_expect("clean fixture: takeCurrent reads+clears+returns", GOOD_SLOT, [])
+
+    # The witness, verbatim: same class, same declaration, body gutted.
+    WITNESS_SLOT = GOOD_SLOT.replace(
+        "        val current = entry ?: return null\n"
+        "        entry = null\n"
+        "        return current.value\n",
+        "        return null\n",
+    )
+    slot_expect(
+        "witness fixture: takeCurrent body returns null",
+        WITNESS_SLOT,
+        ["no longer reads", "no longer clears", "no longer returns"],
+    )
+
+    slot_expect(
+        "breaker: takeCurrent reads but never clears the slot",
+        GOOD_SLOT.replace("        entry = null\n", ""),
+        ["no longer clears"],
+    )
+    slot_expect(
+        "breaker: takeCurrent clears but drops the value",
+        GOOD_SLOT.replace("        return current.value\n", "        return null\n"),
+        ["no longer returns"],
+    )
+    # Re-assigning the same reference back is not a clear — the entry is still
+    # there for the next teardown to hand out twice.
+    slot_expect(
+        "breaker: takeCurrent reassigns the entry instead of clearing it",
+        GOOD_SLOT.replace("        entry = null\n", "        entry = entry\n"),
+        ["no longer clears"],
+    )
+    slot_expect(
+        "breaker: takeCurrent declaration removed",
+        GOOD_SLOT.replace("fun takeCurrent()", "fun takeWhatever()"),
+        ["entry point is gone", "no longer reads", "no longer clears", "no longer returns"],
+    )
+
+    # The real AsyncJsSlot.kt must satisfy all four: the witness arms above are
+    # only meaningful if the accepted shape is the shape on disk.
+    repo = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
+    slot_path = os.path.join(repo, SLOT)
+    if not os.path.isfile(slot_path):
+        fails.append("real tree: %s missing — cannot evaluate the slot criterion" % SLOT)
+        print("  [FAIL] real tree: %s missing" % SLOT)
+    else:
+        real_slot = open(slot_path, encoding="utf-8").read()
+        slot_expect("real tree: AsyncJsSlot.takeCurrent", real_slot, [])
+        # Verbatim witness from the external audit: exactly one match, and it
+        # must red every body criterion. A drifting file (body rewritten) makes
+        # this arm FAIL loudly instead of silently proving nothing.
+        witness_find = (
+            "    fun takeCurrent(): T? {\n"
+            "        val current = entry ?: return null\n"
+            "        entry = null\n"
+            "        return current.value\n"
+            "    }"
+        )
+        n = real_slot.count(witness_find)
+        expect("real tree: witness anchor occurs exactly once (found %d)" % n, n == 1, True)
+        if n == 1:
+            slot_expect(
+                "real tree + witness patch: gate reds the gutted body",
+                real_slot.replace(witness_find, "    fun takeCurrent(): T? {\n        return null\n    }"),
+                ["no longer reads", "no longer clears", "no longer returns"],
+            )
 
     # ── [deep-audit-1045 B-02] lifecycle contract ────────────────────────────
     # Every arm states its EXPECTED RED SET up front (hand-written from the

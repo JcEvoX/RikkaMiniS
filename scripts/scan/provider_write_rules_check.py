@@ -39,6 +39,15 @@ silent pass):
       `provider.instances.create` / `instancesUpdate` bodies
       (ProviderMutationMethods). fail-closed: an unknown/moved anchor is RED.
 
+  W10 [meta-audit-1024 anchor] W8 pins the *declaration* and the *call sites*;
+  the external witness stripped `.trim()` out of the helper's own body while
+  leaving both intact, so the gate stayed green while every write face began
+  persisting padded / blank URLs again. W10 therefore reads the body: it must
+  carry whitespace normalization (`.trim()`) AND the blank -> null collapse
+  (`takeIf { it.isNotEmpty() }` / `takeIf { it.isNotBlank() }` /
+  `ifEmpty { null }`). A body that cannot be extracted is RED (fail-closed),
+  never a silent pass.
+
 Usage:  provider_write_rules_check.py <repo-root>
         provider_write_rules_check.py --selftest
 """
@@ -203,6 +212,84 @@ def extract_function(code, name):
     return None
 
 
+# [meta-audit-1024 anchor] W10 reads the *body* of the shared normalization
+# helper: whitespace normalization (trim) AND the blank -> null collapse. Both
+# have to be there; the witness removed only the trim and the gate stayed green.
+TRIM_RE = re.compile(r"\.trim[A-Za-z]*\s*\(")
+COLLAPSE_RE = re.compile(
+    r"takeIf\s*\{[^}\n]*isNot(?:Empty|Blank)\(\)"
+    r"|ifEmpty\s*\{[^}\n]*null"
+)
+
+
+def policy_body(code, name):
+    """Body of the shared policy `fun <name>` — expression bodies first (the
+    paren-safe scanner), block bodies via `extract_function`.
+
+    [meta-audit-1024] `extract_function` alone truncates
+    `= raw?.trim()?.takeIf { … }` at the first balanced paren, which is exactly
+    why the old anchor check could not see the body. None = fail-closed.
+    """
+    body = expression_body(code, name)
+    if body is not None:
+        return body
+    body = extract_function(code, name)
+    if body is None:
+        return None
+    return body if body.lstrip().startswith("{") else None
+
+
+def expression_body(code, name):
+    """Body of an expression-bodied `fun <name>(...) = …`.
+
+    [meta-audit-1024 anchor] `extract_function` stops at the FIRST balanced
+    paren pair, so `= raw?.trim()?.takeIf { it.isNotEmpty() }` was captured as
+    `= raw?.trim()` — a body-level criterion built on it would have read only
+    the first call and gone blind on the collapse half. This variant keeps
+    scanning while the expression carries on with `.` / `?.` after a `)`/`}`.
+
+    fail-closed: no declaration, an empty body, or an unterminated (bracket-
+    unbalanced) body all return None, which every caller must treat as RED.
+    """
+    m = re.search(
+        r"\bfun\s+%s\s*\((?:[^()]|\([^()]*\))*\)\s*(?::[^\n={]+)?=" % re.escape(name),
+        code,
+    )
+    if not m:
+        return None
+    j = m.end() - 1  # index of '='
+    k = j + 1
+    while k < len(code) and code[k] in " \t\r\n":
+        k += 1
+    depth = 0
+    opened = False
+    while k < len(code):
+        c = code[k]
+        if c in "([{":
+            depth += 1
+            opened = True
+        elif c in ")]}":
+            depth -= 1
+            if depth < 0:
+                return None
+            if depth == 0:
+                nxt = k + 1
+                while nxt < len(code) and code[nxt] in " \t":
+                    nxt += 1
+                if nxt < len(code) and code[nxt] in ".?":
+                    k = nxt
+                    continue
+                return code[j:k + 1]
+        elif c == "\n" and depth == 0:
+            # A bare single-token body (`= raw`) is extractable and is exactly
+            # the "helper emptied out" shape W10 must catch, so only an EMPTY
+            # body is fail-closed here.
+            text_so_far = code[j:k]
+            return text_so_far if text_so_far.strip("= \t\r\n") else None
+        k += 1
+    return None  # unterminated body — fail-closed
+
+
 def count_decl(root, needle):
     """Occurrences of `needle` across every .kt file under SRC_SCAN_ROOT."""
     hits = []
@@ -223,7 +310,7 @@ def count_decl(root, needle):
 
 def check_tree(root):
     detail = {k: [] for k in ("w1", "w2", "w3", "w4", "w5", "w6", "w7",
-                               "w8", "w9", "fail_closed")}
+                               "w8", "w9", "w10", "fail_closed")}
 
     pwr = read_code(os.path.join(root, PWR_REL))
     pc = read_code(os.path.join(root, PC_REL))
@@ -328,6 +415,25 @@ def check_tree(root):
     elif norm_decls[0][0] != PWR_REL:
         detail["w8"].append("normalizeCustomBaseURL declared in %s, expected %s"
                             % (norm_decls[0][0], PWR_REL))
+
+    # ---- W10 [meta-audit-1024 anchor] the normalization BODY still normalizes
+    # W8 pins the declaration head and the call sites; the external witness
+    # stripped `.trim()` out of the body while leaving both intact, so the gate
+    # stayed green while every write face persisted padded / blank URLs again.
+    # The declaration is not the decision point — its body is.
+    norm_body = policy_body(pwr, "normalizeCustomBaseURL")
+    if norm_body is None:
+        detail["fail_closed"].append(
+            "normalizeCustomBaseURL body not extractable from ProviderWriteRules — re-anchor W10")
+    else:
+        if not TRIM_RE.search(norm_body):
+            detail["w10"].append(
+                "normalizeCustomBaseURL body lost its whitespace normalization (.trim()): %r"
+                % norm_body.strip()[:90])
+        if not COLLAPSE_RE.search(norm_body):
+            detail["w10"].append(
+                "normalizeCustomBaseURL body lost its blank->null collapse: %r"
+                % norm_body.strip()[:90])
 
     # ---- W9 [deep-audit-1039 A-04] the read side trims before use ----
     pcf = read_code(os.path.join(root, PCF_REL))
@@ -513,7 +619,9 @@ def run_selftest():
     # include the helper, so removing it reds W8 only. That asymmetry is
     # deliberate: W1's list is the ARCH-01 baseline (frozen so an unrelated
     # rename cannot silently satisfy it), W8 owns the new criterion.
-    run_real("S7-normalize-helper-missing-W8", helper_gone2, ("w8",))
+    # W10 also reads the body, so a renamed helper leaves W10's body
+    # unextractable — fail-closed, alongside W8's declaration miss.
+    run_real("S7-normalize-helper-missing-W8", helper_gone2, ("w8", "fail_closed"))
 
     # S8: the collection writer reverts to its own inline blank handling — W8.
     run_real("S8-writer-inline-blank-W8", replace_in(
@@ -571,6 +679,45 @@ def run_selftest():
         "            val base = customBaseURL?.trim()?.trimEnd('/')?.takeIf { it.isNotEmpty() } ?: return null",
         "            val base = customBaseURL?.trim()?.takeIf { it.isNotEmpty() } ?: return null"), ("w9",))
 
+    # ─── [meta-audit-1024 anchor] W10 — the normalization BODY ─────────────
+    # S16 is the external witness itself: declaration and every call site stay
+    # put, only `.trim()` leaves the body. Before W10 this shape was GREEN while
+    # padded / blank URLs were persisted again by every write face.
+
+    # S16: witness — the helper body loses its whitespace normalization. W10
+    # only (W8's declaration + call sites are untouched, as in the witness).
+    run_real("S16-witness-body-drops-trim-W10", replace_in(
+        PWR_REL,
+        "internal fun normalizeCustomBaseURL(raw: String?): String? =\n"
+        "    raw?.trim()?.takeIf { it.isNotEmpty() }",
+        "internal fun normalizeCustomBaseURL(raw: String?): String? =\n"
+        "    raw?.takeIf { it.isNotEmpty() }"), ("w10",))
+
+    # S17: the other half of the same criterion — the collapse goes away, so a
+    # padded-but-blank string survives instead of becoming a clear.
+    run_real("S17-body-drops-collapse-W10", replace_in(
+        PWR_REL,
+        "internal fun normalizeCustomBaseURL(raw: String?): String? =\n"
+        "    raw?.trim()?.takeIf { it.isNotEmpty() }",
+        "internal fun normalizeCustomBaseURL(raw: String?): String? =\n"
+        "    raw?.trim()"), ("w10",))
+
+    # S18: the body is emptied out entirely (a no-op helper that returns its
+    # input) — W10 reds, and the faces still call it so W8 stays green: the
+    # "declaration + call site" anchor proves nothing about behaviour.
+    run_real("S18-body-emptied-W10", replace_in(
+        PWR_REL,
+        "internal fun normalizeCustomBaseURL(raw: String?): String? =\n"
+        "    raw?.trim()?.takeIf { it.isNotEmpty() }",
+        "internal fun normalizeCustomBaseURL(raw: String?): String? =\n"
+        "    raw"), ("w10",))
+
+    # S19: precision — the accepted shape (the real tree, both halves present)
+    # must stay GREEN: W10 fires only on a missing half, never on the accepted
+    # spelling. Same content as S15, deliberately re-run under the W10 name so a
+    # future edit of either criterion has its own green arm.
+    run_real("S19-fixed-shape-green-W10", lambda rel, text: text, ())
+
     # S15: contrast — a fixture where the helper is consumed on every face and
     # the getter keeps both guards must stay GREEN (no criterion fires on the
     # accepted shape).
@@ -598,7 +745,8 @@ def main():
     if rc == 0:
         print("provider_write_rules: ALL GREEN (W1 shared rules, W2/W3 single declaration, "
               "W4 no literal copies, W5 debug wiring, W6 modelsAdd, W7 writer wiring, "
-              "W8 normalization single-sourced on every write face, W9 read side trims)")
+              "W8 normalization single-sourced on every write face, W9 read side trims, "
+              "W10 normalization body still trims and collapses)")
         return 0
     print("provider_write_rules: FAIL")
     print(json.dumps(detail, indent=2))
