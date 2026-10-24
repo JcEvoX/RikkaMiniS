@@ -172,10 +172,21 @@ python3 /var/minis/skills/meta-audit-witness/scripts/verify_witness.py \
 
 ## 6. CI run
 
-- run **#2622** / id `40103566987` / job `120900186310`，attempt 1，**success**，event=`workflow_dispatch`
-- head_sha `__HEAD__`（本地 HEAD 逐字符一致）
-- 日志 1,478,xxx B；门头 112 互异；`Summary: 112 passed, 0 failed` 恰一条；`ALL 344 CASES PASS`；`Z e:` 0
-- 前一轮（含 test_scan 改动）run #2621 / `78528834` 亦 success，已按冻结面回滚，最终树不含该改动
+- run **#2626** / id `40103957426` / job `120901660972`，attempt 1，**success**，event=`workflow_dispatch`
+- head_sha `66166671d14b10c9233dd7035516eddb6f0a9468`（本地 HEAD 逐字符一致）
+- 日志 **1,480,295 B**；26 步 `not_ok=[]`、唯一 `skipped` = 步骤 23 `Publish to Releases`（main 门控）
+- `Summary: 112 passed, 0 failed` **恰一条**（其余 7 条 Summary 全 0 failed）；门头 `[1/112]…[112/112]`
+  **112 个互异**；`ALL 344 CASES PASS`；`Z e: ` **0**；含 `FAILED` 的 6 行逐条确认全是 **PASSED** 用例名子串
+- 本门在 CI 的真实证据：`offload_host_path_check: 22 handler file(s) + 2 intent dispatcher(s) scanned,
+  0 violations — OFFLOAD-HOST-PATH GATE OK`（实时跑的是改后的 R1b + R7 判据）
+- 前一轮 run #2621 / `78528834` 亦 success（当时含 test_scan 改动，已按冻结面回滚）。
+
+**CI 未见证的部分（重要，登记为 §7 R9）**：`M6_TAINT_SELFTEST` 在日志里 **0 命中**——本门的
+`--selftest` 原始 stdout 不进 CI 日志（与 1041 波结论一致），M6 九臂要靠 `test_scan.py` 的夹具
+断言才能被 CI 见证，而那是冻结面。⇒ **主会话并集收口时必须补注册**：
+`("offload_host_path_check", "M6_TAINT_SELFTEST=PASS", (REPO_ROOT,))`。
+在此之前「CI 绿」只覆盖**判据在真树上的行为**，不覆盖**新臂本身有牙**（后者由本支 L1 + L3 变异轮
+在本地取过证）。
 
 ## 7. 残留登记（供主会话统一登记 backlog / credibility，本支未写）
 
@@ -189,6 +200,7 @@ python3 /var/minis/skills/meta-audit-witness/scripts/verify_witness.py \
 | R6 | 门臂期望计数是与新判据绑定的**手写字面量** | 下次修改 R1/R7 判据形态 | 同步改臂期望 + 重跑 `probe/m6_mutations.py` | 字面量正是「自指陷阱」防线的要求（期望不从未测常量推导），不能自动同步 |
 | R7 | `scan_photos_import_sanitisation` 只在 `main()` 调用（不在 `check_tree`）：全部旧 selftest 夹具树里没有 photos 文件，若放进 `check_tree` 会一次性打红 40+ 旧臂 | 若未来有工具绕过 `main()` 直接调 `check_tree` 验证 | 把该判据搬进 `check_tree` 并给夹具补 photos 文件（或用「文件缺失 ⇒ skip」+ 单独 fail-closed 臂） | CI 走 `scan.sh` → `main()`，现有调用面已覆盖；改造会触碰全部旧夹具 |
 | R8 | 可信度台账（`credibility.md`）由主会话更新：本门从「C（无外部见证）」升到「**B+ / 已被外部见证证伪且见证转正为 selftest 臂**」的依据 = §5.2 + §5.3 | 主会话收口时 | 按四层证据升级 | 本支不写共享台账 |
+| R9 | **M6 九臂在 CI 里尚未被见证**：`M6_TAINT_SELFTEST` 在 run #2626 日志 0 命中（门自证 stdout 不进 CI 日志），要 `test_scan.py` 注册才进 CI，而那是冻结面 | 主会话并集收口时**必做** | 在 `test_scan.py` 加 `("offload_host_path_check", "M6_TAINT_SELFTEST=PASS", (REPO_ROOT,))` + 真树绿一例（本支已验证该断言可用，夹具 344→346） | 任务书 §3.2 冻结 `scan.sh`/`test_scan.py`，注册统一在收口做（1046 波同规） |
 
 ## 8. 复现命令
 
