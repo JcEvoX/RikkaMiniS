@@ -99,6 +99,15 @@ class SessionsOffloadHandler(
                 EXIT_INVALID_ARGS,
                 OffloadOutput.formatBody(err.toString(2), args) + "\n" + HELP_TEXT,
             )
+        } catch (e: InvalidPageSize) {
+            // [dv29-A3 A-05] A spelled page size the command cannot honour is a
+            // usage error, not a clamp: the clamped answer (1 / 50 / 100) read
+            // as a real page and hid the caller's mistake.
+            val err = errorEnvelope(sub, "INVALID_ARGS", e.message ?: "invalid page size")
+            NativeOffloadResult(
+                EXIT_INVALID_ARGS,
+                OffloadOutput.formatBody(err.toString(2), args) + "\n" + HELP_TEXT,
+            )
         } catch (e: InvalidDateArg) {
             // [da1032-C] ISSUE-08: a date flag the caller supplied that this
             // command cannot read refuses the command, instead of silently
@@ -421,10 +430,19 @@ class SessionsOffloadHandler(
         return cal.timeInMillis - 1
     }
 
-    private fun parseLimit(args: OffloadArgs): Int {
-        val raw = args.getInt("limit") ?: return DEFAULT_LIMIT
-        return raw.coerceIn(1, MAX_LIMIT)
-    }
+    /**
+     * [dv29-A3 A-05] The page size, through the shared contract. The old
+     * `getInt("limit") ?: DEFAULT_LIMIT` + `coerceIn(1, MAX_LIMIT)` answered
+     * `--limit 0` with ONE row, `--limit 1000` with 100 and `--limit abc` with
+     * 50 — three different false answers, all at exit 0, all indistinguishable
+     * from a real page. Refused instead, with the same INVALID_ARGS envelope +
+     * exit 2 the date bounds already use.
+     */
+    private fun parseLimit(args: OffloadArgs): Int =
+        when (val size = PageSizeOutcome.resolve(args, OffloadPageSize.SESSIONS)) {
+            is PageSizeOutcome.Ok -> size.value
+            is PageSizeOutcome.Invalid -> throw InvalidPageSize(size.message)
+        }
 
     // ─── envelope helpers ─────────────────────────────────────────────
 
@@ -458,8 +476,6 @@ class SessionsOffloadHandler(
     companion object {
         private const val TAG = "SessionsOffload"
         private const val TOOL_NAME = "minis-sessions-cli"
-        private const val DEFAULT_LIMIT = 50
-        private const val MAX_LIMIT = 100
         private const val EXIT_FAILURE = 1
 
         /**
@@ -543,7 +559,8 @@ OPTIONS:
   --offset <n>          Skip first n messages, 0-based (default: 0)
   --start <YYYY-MM-DD>  Filter results after this date (inclusive)
   --end <YYYY-MM-DD>    Filter results before this date (inclusive, end of day)
-  --limit <n>           Max results (default: 50, max: 100)
+  --limit <n>           Max results (default: 50, range 1..100; outside that range is
+                        a usage error, exit 2)
   --prompt <text>       (send only) The prompt to send
   --session <id>        (send only) Continue an existing session (default: new)
   --async               (send only) Return immediately with the session id
@@ -596,6 +613,17 @@ EXAMPLES:
  */
 internal class InvalidDateArg(flag: String, raw: String) :
     Exception("$flag '$raw' is not a YYYY-MM-DD date (e.g. 2026-10-19).")
+
+/**
+ * [dv29-A3 A-05] A `--limit` the command cannot honour (not an integer, zero,
+ * negative, or above the surface's documented cap).
+ *
+ * Its own class rather than a reuse of [InvalidDateArg] because the message has
+ * to be true — the caller's date was fine, the page size was not. [handle]
+ * answers it with the same `INVALID_ARGS` envelope + exit 2 the date refusals
+ * use, after [OffloadPageSize.SESSIONS]' range is applied.
+ */
+internal class InvalidPageSize(message: String) : Exception(message)
 
 /**
  * [dv15-A1 A-08] Both bounds readable, but `--end` lands before `--start`.

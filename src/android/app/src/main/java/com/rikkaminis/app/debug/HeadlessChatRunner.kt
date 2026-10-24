@@ -6,13 +6,17 @@ import com.rikkaminis.app.MinisApp
 import com.rikkaminis.app.config.BindingTarget
 import com.rikkaminis.app.config.SessionConfigWriteThrough
 import com.rikkaminis.app.config.resolveBindingTarget
+import com.rikkaminis.app.data.model.ModelEntry
+import com.rikkaminis.app.data.model.ProviderInstance
 import com.rikkaminis.app.data.model.ThinkingLevel
 import com.rikkaminis.app.logging.AppLogger
 import com.rikkaminis.app.ui.chat.ChatViewModel
 import com.rikkaminis.app.ui.chat.ChatViewModelStore
 import com.rikkaminis.app.ui.chat.InputAttachment
+import com.rikkaminis.app.ui.chat.SessionModelResolution
 import com.rikkaminis.app.ui.chat.addAttachment
 import com.rikkaminis.app.ui.chat.applyDefaultModelFallback
+import com.rikkaminis.app.ui.chat.decideSessionModelResolution
 import com.rikkaminis.app.ui.chat.restoreFromBinding
 import com.rikkaminis.app.ui.chat.selectEntry
 import com.rikkaminis.app.ui.chat.setThinkingLevel
@@ -86,6 +90,79 @@ internal object HeadlessChatRunner {
         providerFor(context, sessionId)[ChatViewModel::class.java]
 
     /**
+     * [dv29-A2] Fail-closed SESSION-EXISTENCE gate for every entry that can
+     * reach [com.rikkaminis.app.data.repository.ChatRepository.appendMessage].
+     *
+     * `messages.session_id` is a foreign key into `chat_sessions` (MessageEntity,
+     * onDelete=CASCADE), so a send into an id with no row raises
+     * `FOREIGN KEY constraint failed (code 787)`: the user row never lands, and
+     * `nextSortOrder` answers 0 for a session that does not exist. Before
+     * [ChatRepository.appendMessage] learned to tell the two constraints apart
+     * the replay repeated the identical insert and the second throw escaped the
+     * catch — an uncaught coroutine exception that ACRA turned into a process
+     * kill (2026-10-24 12:57 ×2, `minis-sessions-cli send --session
+     * <missing id>`). The classification fix stops the replay; this gate is the
+     * other half, the one that answers the caller: a missing session is a
+     * structured `-32602`, not silence followed by a crash.
+     *
+     * Call it BEFORE building the ViewModel: `viewModel(…)` materialises a VM
+     * for any id, and a resident VM is one of the two things that legitimately
+     * stands in for a row (a `__new__…` draft that the send path is about to
+     * promote).
+     */
+    internal suspend fun requireSendableSession(app: MinisApp, sessionId: String) {
+        val persisted = withContext(Dispatchers.IO) {
+            app.chatRepository.dao.getSession(sessionId)
+        } != null
+        if (persisted) return
+        val resident = withContext(Dispatchers.Main) {
+            ChatViewModelStore.peekViewModel(sessionId)
+        }
+        if (resident != null) return
+        AppLogger.warning(
+            TAG,
+            "requireSendableSession: no row and no resident VM for '$sessionId' — " +
+                "refusing the send instead of appending into a missing parent",
+        )
+        throw RPCException(-32602, "session_not_found: $sessionId")
+    }
+
+    /**
+     * [dv29-A2] The first member of [members] the runtime would actually use,
+     * or null when there is none.
+     *
+     * Same single decision as the session-model gate
+     * ([decideSessionModelResolution]) — the exact judgement
+     * `ConfigBuiltins.firstUsableGroupMember` applies to
+     * `session.primaryModel`, kept call-site-visible here (this file cannot
+     * import that private helper) so a group binding write can never pick a
+     * DISABLED or KEYLESS head member, nor report a group whose every member is
+     * unusable as applied.
+     */
+    internal fun firstUsableGroupEntry(
+        members: List<ModelEntry>,
+        instanceOf: (String) -> ProviderInstance?,
+        apiKeyOf: (String) -> String?,
+    ): ModelEntry? = members.firstOrNull { member ->
+        val instance = instanceOf(member.providerInstanceId)
+        decideSessionModelResolution(
+            member,
+            instance,
+            instance?.let { apiKeyOf(it.id) },
+        ) is SessionModelResolution.Use
+    }
+
+    /**
+     * [dv29-A2] Why a model binding was refused, as a stable token for the RPC
+     * error text — null when the decision says the target IS usable.
+     *
+     * The reason names come from the shared enum, so the RPC surface cannot
+     * drift from the runtime gate's vocabulary.
+     */
+    internal fun bindingRejectReason(decision: SessionModelResolution): String? =
+        (decision as? SessionModelResolution.Unusable)?.reason?.name
+
+    /**
      * Ensure a session exists in the DB before binding a ViewModel. Mirrors
      * the in-app flow that creates a draft session lazily; for RPC-driven
      * automation we materialize it eagerly so subsequent reads can resolve
@@ -137,6 +214,11 @@ internal object HeadlessChatRunner {
             throw RPCException(-32602, "modelEntryId and modelGroupId are mutually exclusive")
         }
         val app = app(context)
+        // [dv29-A2] Structured rejection for a session that does not exist —
+        // see [requireSendableSession]. Called before the existing-binding read
+        // below, because that read answers "null" for a missing row and the
+        // branch then happily writes a binding nobody can restore.
+        requireSendableSession(app, sessionId)
         val cfg = app.providerRepository.config.value
         // [dv25-A05] The default primary group is a NEW-SESSION default, not an
         // override. It used to be applied unconditionally when both parameters
@@ -168,9 +250,26 @@ internal object HeadlessChatRunner {
             is BindingTarget.Entry -> {
                 val entry = cfg.modelEntries.firstOrNull { it.id == target.entryId }
                     ?: throw RPCException(-32602, "Entry not found: ${target.entryId}")
-                val instance = cfg.instances.firstOrNull { it.id == entry.providerInstanceId }
-                    ?: throw RPCException(-32602, "Provider instance for entry not found")
-                if (!instance.isEnabled) throw RPCException(-32602, "Provider instance is disabled")
+                // [dv29-A2] Usability, not just existence. `isEnabled` alone
+                // let a key-less instance through: the row was written, the
+                // resident VM refused to restore it (restoreFromBinding runs
+                // the same decision) and fell back to the default model, while
+                // this function returned the refused model's name — the RPC
+                // said "used X" for a turn that ran on something else. Same
+                // single decision `session.primaryModel` already uses.
+                val instance = app.providerRepository.instance(entry.providerInstanceId)
+                val decision = decideSessionModelResolution(
+                    entry,
+                    instance,
+                    instance?.let { app.providerRepository.loadApiKey(it.id) },
+                )
+                if (decision !is SessionModelResolution.Use) {
+                    val reason = bindingRejectReason(decision) ?: "UNUSABLE"
+                    throw RPCException(
+                        -32602,
+                        "entry:${entry.id} is not usable — $reason",
+                    )
+                }
                 // The binding column stores a JSON object the VM parses in
                 // restoreFromBinding (ChatViewModel: {"type":"entry","entryId":…}).
                 // Writing the bare literal "entry" left restoreFromBinding unable to
@@ -185,9 +284,31 @@ internal object HeadlessChatRunner {
             is BindingTarget.Group -> {
                 val group = cfg.modelGroups.firstOrNull { it.id == target.groupId }
                     ?: throw RPCException(-32602, "Group not found: ${target.groupId}")
-                val firstMemberId = group.memberEntryIds.firstOrNull()
-                val firstMember = firstMemberId?.let { mid -> cfg.modelEntries.firstOrNull { it.id == mid } }
-                val resolvedModelId = firstMember?.baseModel?.id ?: ""
+                // [dv29-A2] A group is usable only when at least one member is,
+                // and `model_id` must name the member the runtime would pick —
+                // not `memberEntryIds.first()`, which could itself be the
+                // disabled / keyless one (that wrote a `model_id` no member
+                // matches while the VM silently fell back).
+                val members = group.memberEntryIds.mapNotNull { mid ->
+                    cfg.modelEntries.firstOrNull { it.id == mid }
+                }
+                if (members.isEmpty()) {
+                    throw RPCException(
+                        -32602,
+                        "Group ${group.id} references no existing model entry — " +
+                            "every member id in ${group.memberEntryIds} is gone",
+                    )
+                }
+                val usableMember = firstUsableGroupEntry(
+                    members = members,
+                    instanceOf = { iid -> app.providerRepository.instance(iid) },
+                    apiKeyOf = { iid -> app.providerRepository.loadApiKey(iid) },
+                ) ?: throw RPCException(
+                    -32602,
+                    "Group ${group.id} has no usable member — every member's " +
+                        "provider instance is disabled or has no API key",
+                )
+                val resolvedModelId = usableMember.baseModel.id
                 // Same JSON-object shape the VM expects for a group binding.
                 val groupBinding = """{"type":"group","groupId":"${group.id}"}"""
                 persistBinding(app, sessionId, groupBinding, resolvedModelId)
@@ -276,8 +397,12 @@ internal object HeadlessChatRunner {
         wait: Boolean,
         timeoutMs: Long,
     ): PromptResult = withContext(Dispatchers.Main) {
-        val vm = viewModel(context, sessionId)
         val app = app(context)
+        // [dv29-A2] Before `viewModel(…)` materialises a VM for any id: a send
+        // into a session that does not exist appends into a missing FK parent
+        // (that is the 2026-10-24 process kill). Structured refusal instead.
+        requireSendableSession(app, sessionId)
+        val vm = viewModel(context, sessionId)
         // Apply per-call thinking override BEFORE sendMessage so streamMessage
         // picks up the new level. Caller passes null to keep the VM's existing
         // setting (default OFF for a fresh VM, last user-set value otherwise).
@@ -456,6 +581,8 @@ internal object HeadlessChatRunner {
         timeoutMs: Long,
     ): PromptResult = withContext(Dispatchers.Main) {
         val app = app(context)
+        // [dv29-A2] Same gate as prompt(): the retry path re-appends rows.
+        requireSendableSession(app, sessionId)
         val vm = viewModel(context, sessionId)
         val targetMsgId = messageId ?: run {
             val msgs = app.chatRepository.loadMessages(sessionId)
@@ -591,6 +718,8 @@ internal object HeadlessChatRunner {
         timeoutMs: Long,
     ): PromptResult = withContext(Dispatchers.Main) {
         val app = app(context)
+        // [dv29-A2] Same gate as prompt(): rerun deletes and re-appends rows.
+        requireSendableSession(app, sessionId)
         val vm = viewModel(context, sessionId)
         val ready = withContext(Dispatchers.Default) {
             withTimeoutOrNull(5000L) { vm.activeEntryId.first { it != null } }
@@ -771,6 +900,20 @@ internal object HeadlessChatRunner {
         // compact branch appends a system-info but leaves _compactSummary
         // untouched, never flipping _isCompacting true).
         val priorSummary = vm.compactSummary.value
+        // [dv29-A2] …and the prior compact MARKER. `isCompacting` flipping
+        // back to false means "the compact job finished", not "it compacted
+        // anything": `compactAll` sets the flag before its work and clears it in
+        // `finally`, so a provider exception, an empty summary and a stale
+        // anchor all end in the identical `false` with no marker written. That
+        // used to be reported as `Completed` (the `else -> "Completed"` arm),
+        // i.e. "context folded" while the transcript was untouched. The marker
+        // row IS the artifact a successful fold writes (ChatDao
+        // .insertCompactMarker, one fresh uuid per success), so it is the
+        // evidence to settle on.
+        val app = app(context)
+        val priorMarkerId = withContext(Dispatchers.IO) {
+            app.chatRepository.dao.latestCompactMarker(sessionId)?.id
+        }
         if (messageId != null) {
             vm.compactBefore(messageId, includesBoundary)
         } else {
@@ -808,16 +951,19 @@ internal object HeadlessChatRunner {
             } ?: false
         }
         val newSummary = vm.compactSummary.value
-        val changed = newSummary != priorSummary && !newSummary.isNullOrBlank()
+        // `Changed` alone is not enough: a successful compact that folds a range
+        // into an identical string leaves _compactSummary equal, so the marker
+        // delta is the primary witness and the string delta the secondary one.
+        val markerLanded = withContext(Dispatchers.IO) {
+            app.chatRepository.dao.latestCompactMarker(sessionId)?.id
+        }.let { it != null && it != priorMarkerId }
+        val summaryChanged = newSummary != priorSummary && !newSummary.isNullOrBlank()
+        val settled = settleCompactOutcome(finished, markerLanded, summaryChanged)
         CompactResult(
-            status = when {
-                !finished -> "Timeout"
-                changed -> "Completed"
-                else -> "Completed"   // marker may have written even if string equal
-            },
+            status = settled.status,
             summary = newSummary,
             timedOut = !finished,
-            error = null,
+            error = settled.error,
         )
     }
 
@@ -945,6 +1091,9 @@ internal object HeadlessChatRunner {
      */
     suspend fun selectModel(context: Context, sessionId: String, entryId: String):
         Pair<String, String> = withContext(Dispatchers.Main) {
+        val app = app(context)
+        // [dv29-A2] Refuse before creating a VM for a session that does not exist.
+        requireSendableSession(app, sessionId)
         val vm = viewModel(context, sessionId)
         // OFF Main (the load resumes on Main.immediate — waiting on Main would
         // deadlock it) and bounded (an unbounded wait pins the RPC connection).
@@ -954,8 +1103,38 @@ internal object HeadlessChatRunner {
         if (sessionReady == null) {
             throw RPCException(-32000, "session_not_loaded_in_5s: $sessionId")
         }
+        // [dv29-A2] `ChatViewModel.selectEntry` REFUSES silently on an
+        // unknown / disabled / key-less target (a UI contract this entry must
+        // not change: ChatScreen taps rely on the silent early return). Left
+        // unchecked, this method then returned the PREVIOUS model's name next
+        // to the caller's rejected id — "switched to X" for a switch that never
+        // happened, which is worse than a refusal because automation continues
+        // on the old model believing otherwise. Decide with the same single
+        // source the runtime gate uses, then verify the switch landed.
+        val cfg = app.providerRepository.config.value
+        val entry = cfg.modelEntries.firstOrNull { it.id == entryId }
+            ?: throw RPCException(-32602, "Entry not found: $entryId")
+        val instance = app.providerRepository.instance(entry.providerInstanceId)
+        val decision = decideSessionModelResolution(
+            entry,
+            instance,
+            instance?.let { app.providerRepository.loadApiKey(it.id) },
+        )
+        if (decision !is SessionModelResolution.Use) {
+            val reason = bindingRejectReason(decision) ?: "UNUSABLE"
+            throw RPCException(-32602, "entry:$entryId is not usable — $reason")
+        }
         vm.selectEntry(entryId)
-        // selectEntry sets currentModel/_modelName synchronously.
+        // selectEntry sets currentModel/_modelName synchronously on the success
+        // path; when it took one of its refusal branches the state is untouched.
+        // Read the observable fact instead of trusting the call.
+        val active = vm.activeEntryId.value
+        if (active != entryId) {
+            throw RPCException(
+                -32000,
+                "model_switch_not_applied: requested=$entryId active=${active ?: "null"}",
+            )
+        }
         vm.modelName.value to vm.thinkingLevel.value.name
     }
 
@@ -992,6 +1171,35 @@ internal object HeadlessChatRunner {
             sb.toString().ifEmpty { null }
         } catch (_: Exception) { partsJson.ifEmpty { null } }
     }
+
+    /**
+     * [dv29-A2] How one compact attempt settles, from evidence rather than from
+     * a flag transition.
+     *
+     * - `!finished` → the wait timed out; whether it later succeeds is unknown,
+     *   so this stays `Timeout` (never a success claim).
+     * - marker landed (a fresh `compact_markers` row) OR the summary string
+     *   changed → something WAS folded: `Completed`.
+     * - `isCompacting` went back to false with neither → `compact_failed:
+     *   nothing_folded`. That is the provider-exception path, the empty-summary
+     *   path and the anchor-validation path, which `compactAll` reaches without
+     *   writing a marker; reporting them as success was the defect.
+     *
+     * Pure on purpose: the three failure paths are pinned as literals in
+     * `HeadlessChatRunnerCompactSettlementTest`.
+     */
+    internal fun settleCompactOutcome(
+        finished: Boolean,
+        markerLanded: Boolean,
+        summaryChanged: Boolean,
+    ): CompactSettlement = when {
+        !finished -> CompactSettlement("Timeout", null)
+        markerLanded || summaryChanged -> CompactSettlement("Completed", null)
+        else -> CompactSettlement("Error", "compact_failed:nothing_folded")
+    }
+
+    /** [dv29-A2] `status` / `error` pair produced by [settleCompactOutcome]. */
+    internal data class CompactSettlement(val status: String, val error: String?)
 
     data class PromptResult(
         val status: String,

@@ -47,7 +47,7 @@ class OpenOffloadHandler(private val context: Context) : NativeOffloadHandler {
         return tryOpen(url, args)
     }
 
-    private fun tryOpen(url: String, args: OffloadArgs): NativeOffloadResult {
+    private fun tryOpen(url: String, args: OffloadArgs, hop: Int = 0): NativeOffloadResult {
         return try {
             // T259: intent: / android-app: URIs encode action + categories +
             // extras + flags inline (e.g. ACTION_SET_ALARM with HOUR/MINUTES
@@ -90,7 +90,7 @@ class OpenOffloadHandler(private val context: Context) : NativeOffloadHandler {
             NativeOffloadResult(0, OffloadOutput.formatBody(data.toString(2), args) + "\n")
         } catch (e: ActivityNotFoundException) {
             Log.w(TAG, "no handler for '$url'")
-            maybeFallback(url, e, args)
+            maybeFallback(url, e, args, hop)
         } catch (e: SecurityException) {
             val body = JSONObject().put("error", "open_denied")
                 .put("message", "The system refused to open this URL: ${e.message}")
@@ -121,15 +121,26 @@ class OpenOffloadHandler(private val context: Context) : NativeOffloadHandler {
      * Fallback rules for URLs that couldn't be resolved. Returns a friendly
      * error message with a hint the model can relay to the user.
      */
-    private fun maybeFallback(url: String, original: ActivityNotFoundException, args: OffloadArgs): NativeOffloadResult {
-        // market: → Huawei AppGallery on HMS-only devices
-        if (url.startsWith("market://") && OsCompat.isHuawei) {
-            val pkg = Uri.parse(url).getQueryParameter("id")
-                ?: url.substringAfter("details?id=").substringBefore('&')
-            if (pkg.isNotBlank()) {
+    private fun maybeFallback(
+        url: String,
+        original: ActivityNotFoundException,
+        args: OffloadArgs,
+        hop: Int = 0,
+    ): NativeOffloadResult {
+        // market: → Huawei AppGallery on HMS-only devices.
+        // [dv29-A3 A-07] The package name comes from [marketPackageOf], which
+        // answers null when the link carries no `id`. The old
+        // `getQueryParameter("id") ?: substringAfter("details?id=")` used the
+        // receiver as the missing-delimiter default, so `market://search?q=foo`
+        // produced `https://appgallery.huawei.com/app/market://search?q=foo`
+        // and OPENED it. The redirect is also capped at one hop: the target is
+        // an https URL, so a second fallback could only ever repeat the defect.
+        if (url.startsWith("market://") && OsCompat.isHuawei && hop < MAX_FALLBACK_HOPS) {
+            val pkg = marketPackageOf(url)
+            if (pkg != null) {
                 val ag = "https://appgallery.huawei.com/app/$pkg"
                 Log.d(TAG, "market: redirect → AppGallery $ag")
-                return tryOpen(ag, args)
+                return tryOpen(ag, args, hop + 1)
             }
         }
 
@@ -152,6 +163,9 @@ class OpenOffloadHandler(private val context: Context) : NativeOffloadHandler {
 
     companion object {
         private const val TAG = "OpenOffload"
+
+        /** One redirect only — see [maybeFallback]. */
+        private const val MAX_FALLBACK_HOPS = 1
         private const val HELP = """android-open — open a URL or URI with the system handler
 
 Usage:
@@ -164,4 +178,28 @@ market:// URLs automatically fall back to AppGallery.
 Errors are returned as JSON: {"error":"no_handler","message":"...","url":"..."}.
 """
     }
+}
+
+/**
+ * [dv29-A3 A-07] The package name inside a `market://` link, or null when the
+ * link carries none.
+ *
+ * `substringAfter(delimiter)` defaults `missingDelimiterValue` to its RECEIVER,
+ * so the old `url.substringAfter("details?id=")` answered the whole URL for a
+ * link that has no `id` — `market://search?q=foo` became a "package name", and
+ * the Huawei fallback opened `.../app/market://search?q=foo`.
+ *
+ * Hand-parsed instead of `Uri.getQueryParameter` so the decision stays pure (no
+ * Android framework) and testable off-device: a market URL's `id` is a plain
+ * package name, which is the only value this handler accepts here.
+ */
+internal fun marketPackageOf(url: String): String? {
+    if (!url.startsWith("market://")) return null
+    val query = url.substringAfter('?', "")
+    if (query.isEmpty()) return null
+    for (pair in query.split('&')) {
+        if (pair.substringBefore('=', "") != "id") continue
+        return pair.substringAfter('=', "").trim().takeIf { it.isNotEmpty() }
+    }
+    return null
 }

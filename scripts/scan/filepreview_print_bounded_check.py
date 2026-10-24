@@ -150,6 +150,131 @@ def grab_body(text, sig):
     return None
 
 
+# ── [deep-audit-1049 B-05] the print slot's lifecycle ──────────────────────
+#
+# `printFile` hands the framework a WebView and holds it in a module-level slot
+# because `createPrintDocumentAdapter` reads that view lazily while the job
+# spools. Three things did not happen around the slot:
+#
+#   1. The slot was OVERWRITTEN (`printWebView = webView`) with no release of the
+#      previous instance — `releasePrintWebView()`'s own KDoc said "called … at
+#      the start of the next print", and nothing called it there. rapid taps on
+#      two files left the first renderer alive for the life of the process.
+#   2. `onPageFinished` of the superseded view still called
+#      `printManager.print(...)`: the old page keeps loading after the slot is
+#      re-claimed, so a second print dialog appeared, and its
+#      `releasePrintWebView(view)` was a no-op by identity — dialog and renderer
+#      both orphaned.
+#   3. Leaving the preview screen did nothing at all (the slot is not Compose
+#      state), so a printed file kept its renderer until the process died.
+#
+# The criteria are anchored on the SHAPES that make the lifecycle hold, not on
+# "destroy() appears somewhere": the slot declaration, a releaser that both
+# nulls and destroys, a release immediately before every overwrite, a
+# DisposableEffect that releases on exit, and an identity guard in front of
+# `PrintManager.print`.
+SLOT_DECL = "private var printWebView: WebView? = null"
+SLOT_WRITE_RE = re.compile(r"\bprintWebView\s*=(?!=)")
+SLOT_RELEASER_DECL = "private fun releasePrintWebView() {"
+SLOT_RELEASE_CALL_RE = re.compile(r"\breleasePrintWebView\w*\s*\(")
+SLOT_DESTROY_RE = re.compile(r"\.destroy\s*\(\s*\)")
+SLOT_NULL_RE = re.compile(r"\bprintWebView\s*=\s*null\b")
+ON_DISPOSE_RE = re.compile(r"\bonDispose\s*\{")
+ON_PAGE_FINISHED = "override fun onPageFinished(view: WebView, url: String) {"
+PRINT_CALL_RE = re.compile(r"\bprintManager\s*\.\s*print\s*\(")
+SLOT_IDENTITY_RE = re.compile(r"\bprintWebView\s*!==\s*view\b")
+
+
+def _block_at(text, open_idx):
+    depth = 0
+    for j in range(open_idx, len(text)):
+        if text[j] == "{":
+            depth += 1
+        elif text[j] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[open_idx: j + 1]
+    return None
+
+
+def check_print_slot(src):
+    """Contract checks for the print WebView slot. No slot in the file = this
+    criterion has nothing to say (the real tree presence check lives in run())."""
+    problems = []
+    code = strip_comments(src)
+    if "printWebView" not in code:
+        return problems
+    if code.count(SLOT_DECL) != 1:
+        problems.append("the print slot must be declared exactly once "
+                        "(`%s`) — the print path moved, re-point this criterion" % SLOT_DECL)
+    # (1) every overwrite releases what it replaces
+    for m in SLOT_WRITE_RE.finditer(code):
+        line_start = code.rfind("\n", 0, m.start()) + 1
+        line = code[line_start: code.find("\n", m.start())]
+        if "var printWebView" in line:
+            continue  # the declaration itself
+        if not line.strip().startswith("printWebView ="):
+            continue  # reassignments inside the releaser (null) are handled by (2)
+        window = code[max(0, m.start() - 1200): m.start()]
+        if not SLOT_RELEASE_CALL_RE.search(window):
+            problems.append("printFile overwrites the print slot without releasing the "
+                            "previous WebView — the superseded renderer stays alive and "
+                            "its onPageFinished can still pull a second print job")
+    # (2) the releaser nulls the slot AND tears the renderer down
+    body = grab_body(code, SLOT_RELEASER_DECL)
+    if body is None:
+        problems.append("the slot releaser `%s` must exist exactly once"
+                        % SLOT_RELEASER_DECL)
+    else:
+        if not SLOT_NULL_RE.search(body):
+            problems.append("releasePrintWebView must clear the slot (`printWebView = null`) "
+                            "before tearing the view down")
+        if not SLOT_DESTROY_RE.search(body):
+            # Destroying may sit one call away (a `destroyPrintWebView(view)`
+            # helper shared with the superseded-view path) — accept it, but only
+            # when that helper's own body really destroys.
+            destroyed = False
+            for call in re.finditer(r"\b(\w+)\s*\(\s*view\s*\)", body):
+                helper_body = grab_body(code, "private fun %s(" % call.group(1))
+                if helper_body and SLOT_DESTROY_RE.search(helper_body):
+                    destroyed = True
+                    break
+            if not destroyed:
+                problems.append("releasePrintWebView must actually destroy the view "
+                                "(`.destroy()`, directly or through a helper that does) — "
+                                "dropping the reference is not a release")
+    # (3) leaving the preview releases the slot
+    disposes = list(ON_DISPOSE_RE.finditer(code))
+    if not disposes:
+        problems.append("the preview screen has no `onDispose` releasing the print slot — "
+                        "a printed file keeps its renderer until the process dies")
+    else:
+        released = False
+        for m in disposes:
+            block = _block_at(code, code.find("{", m.start()))
+            if block and SLOT_RELEASE_CALL_RE.search(block):
+                released = True
+                break
+        if not released:
+            problems.append("every `onDispose` in the preview must release the print slot "
+                            "(call the releaser) — the slot is module state, not Compose state")
+    # (4) a superseded view must not start a print job
+    page = grab_body(code, ON_PAGE_FINISHED)
+    if page is None:
+        problems.append("`%s` must exist exactly once (anchor missing or duplicated)"
+                        % ON_PAGE_FINISHED)
+    else:
+        first_print = PRINT_CALL_RE.search(page)
+        if first_print is None:
+            problems.append("onPageFinished no longer starts a print job — the print path "
+                            "moved, re-point this criterion")
+        elif not SLOT_IDENTITY_RE.search(page[: first_print.start()]):
+            problems.append("onPageFinished starts a print job without first checking that "
+                            "`view` is still the slot owner — a superseded view whose page "
+                            "finishes late starts a duplicate print dialog")
+    return problems
+
+
 def check(src):
     v = []
     body = grab_body(src, BUILD_ANCHOR)
@@ -201,6 +326,8 @@ def check(src):
     ):
         if needle not in code:
             v.append("%s (required token missing)" % why)
+    # [deep-audit-1049 B-05] the print slot's lifecycle (see check_print_slot).
+    v.extend(check_print_slot(src))
     return v
 
 
@@ -1544,6 +1671,86 @@ def selftest():
         for f in failures:
             print("SELFTEST FAIL " + f)
         return 1
+
+    # ── [deep-audit-1049 B-05] print slot lifecycle (derived checks) ───────
+    # The fixture is a faithful mini version of FilePreviewScreen's print path;
+    # every expectation below is written by hand (never taken from a run).
+    slot_clean = "\n".join([
+        "package probe",
+        "",
+        "private var printWebView: WebView? = null",
+        "private var printWebViewSpooling = false",
+        "",
+        "private fun printFile(context: Context, item: FileItem) {",
+        "    releasePrintWebViewIfNotSpooling()",
+        "    val webView = WebView(context)",
+        "    printWebView = webView",
+        "    printWebViewSpooling = false",
+        "    webView.webViewClient = object : WebViewClient() {",
+        "        override fun onPageFinished(view: WebView, url: String) {",
+        "            if (printWebView !== view) {",
+        "                destroyPrintWebView(view)",
+        "                return",
+        "            }",
+        "            printWebViewSpooling = true",
+        "            val printManager = context.getSystemService(Context.PRINT_SERVICE) as PrintManager",
+        '            printManager.print("job", view.createPrintDocumentAdapter("job"), attrs)',
+        "        }",
+        "    }",
+        "}",
+        "",
+        "private fun releasePrintWebView() {",
+        "    val view = printWebView ?: return",
+        "    printWebView = null",
+        "    printWebViewSpooling = false",
+        "    destroyPrintWebView(view)",
+        "}",
+        "",
+        "private fun destroyPrintWebView(view: WebView) {",
+        "    runCatching {",
+        "        view.stopLoading()",
+        "        view.destroy()",
+        "    }",
+        "}",
+        "",
+        "@Composable",
+        "private fun Preview() {",
+        "    DisposableEffect(Unit) {",
+        "        onDispose { releasePrintWebViewIfNotSpooling() }",
+        "    }",
+        "}",
+        "",
+    ])
+    slot_arms = (
+        ("b05-clean", slot_clean, ()),
+        ("b05-overwrite without release", slot_clean.replace(
+            "    releasePrintWebViewIfNotSpooling()\n", ""),
+         ("overwrites the print slot",)),
+        ("b05-releaser keeps the reference", slot_clean.replace(
+            "    printWebView = null\n", ""), ("must clear the slot",)),
+        ("b05-releaser never destroys", slot_clean.replace(
+            "        view.destroy()\n", ""), ("must actually destroy",)),
+        ("b05-onDispose does nothing", slot_clean.replace(
+            "        onDispose { releasePrintWebViewIfNotSpooling() }",
+            "        onDispose { }"), ("must release the print slot",)),
+        ("b05-no identity guard", slot_clean.replace(
+            "            if (printWebView !== view) {\n"
+            "                destroyPrintWebView(view)\n"
+            "                return\n"
+            "            }\n", ""), ("without first checking",)),
+        ("b05-slot declaration gone", slot_clean.replace(
+            "private var printWebView: WebView? = null\n", ""),
+         ("declared exactly once",)),
+    )
+    for arm_name, sample, want in slot_arms:
+        got = check_print_slot(sample)
+        hit = all(any(w in g for g in got) for w in want) and (
+            bool(want) == bool(got))
+        if hit:
+            print("  SELFTEST %s: OK (%d problem(s))" % (arm_name, len(got)))
+        else:
+            print("  SELFTEST %s: FAIL (want %r, got %r)" % (arm_name, want, got))
+            ok = False
     print("FILEPREVIEW_PRINT_BOUNDED_SELFTEST=PASS")
     return 0
 
@@ -1556,6 +1763,13 @@ def run(root):
     with open(path, encoding="utf-8") as fh:
         src = fh.read()
     v = check(src)
+    # [deep-audit-1049 B-05] `check_print_slot` is silent when the file has no
+    # slot; on the REAL tree that silence would mean the print path moved, so the
+    # presence requirement is enforced here (fixture sources legitimately stop at
+    # buildPrintHtml).
+    if "printWebView" not in strip_comments(src):
+        v.append("the print WebView slot (printWebView) is gone from the preview — the "
+                 "lifecycle criteria below have lost their subject (fail-closed)")
     rc = 0
     if v:
         for item in v:

@@ -3172,7 +3172,9 @@ class ChatViewModel(
         val sendEpoch = streamingClaimEpoch
         val claimToken = streamingClaimToken
 
-        viewModelScope.launch(Dispatchers.IO) {
+        // [dv29-B01] Hold the setup shell in sendShellJob so cancelStream() can
+        // kill the whole turn (same shape/rationale as sendMessage / resume).
+        sendShellJob = viewModelScope.launch(Dispatchers.IO) {
             var streamLaunched = false
             try {
                 val sid = realSessionId.takeIf { it.isNotEmpty() } ?: sessionId
@@ -3298,7 +3300,7 @@ class ChatViewModel(
                     agentHistory.add(entity.toLLMMessage())
                 }
 
-                streamLaunched = runRerunStreamTail(initialProvider, "rerunFromToolBlock")
+                streamLaunched = runRerunStreamTail(initialProvider, "rerunFromToolBlock", sendEpoch, claimToken)
             } finally {
                 if (!streamLaunched) {
                     // [T-stale-finally-vs-new-claim] Only clear under our own claim.
@@ -3419,7 +3421,8 @@ class ChatViewModel(
         val sendEpoch = streamingClaimEpoch
         val claimToken = streamingClaimToken
 
-        viewModelScope.launch(Dispatchers.IO) {
+        // [dv29-B01] Hold the setup shell in sendShellJob — see rerunFromToolBlock.
+        sendShellJob = viewModelScope.launch(Dispatchers.IO) {
             // If setup throws before the inner streamJob is launched, the
             // streaming flag would be stuck true forever. Reset on the
             // unhappy paths; happy path resets in the streamJob's tail.
@@ -3472,7 +3475,7 @@ class ChatViewModel(
                 agentHistory.add(entity.toLLMMessage())
             }
 
-            streamLaunched = runRerunStreamTail(provider, "retryFromMessage")
+            streamLaunched = runRerunStreamTail(provider, "retryFromMessage", sendEpoch, claimToken)
             } finally {
                 if (!streamLaunched) {
                     // [T-stale-finally-vs-new-claim] Only clear under our own claim.
@@ -3915,6 +3918,20 @@ class ChatViewModel(
             val systemPrompt = baseSystemPrompt
 
             // Start agent loop with fallback. _isStreaming was set synchronously at top.
+            // [dv29-B01] Second line of defence (the shell itself is held in
+            // sendShellJob and cancelStream() cancels it, so a stopped turn
+            // normally never reaches here): the claim can also be SUPERSEDED
+            // while this shell runs — cancelStream() mints a fresh token and a
+            // newer turn claims — and a superseded shell must not start a
+            // stream. Same guard shape as resume().
+            if (!isActive ||
+                !_isStreaming.value ||
+                sendEpoch != streamingClaimEpoch ||
+                claimToken !== streamingClaimToken
+            ) {
+                AppLogger.info(TAG_STREAM, "send shell aborted before stream (claim revoked; sid=$activeSessionId)")
+                return@launch
+            }
             streamLaunched = true
             streamJob = launch(Dispatchers.IO) {
                 AppLogger.info(TAG_STREAM, "send streamJob ENTER sid=$activeSessionId")

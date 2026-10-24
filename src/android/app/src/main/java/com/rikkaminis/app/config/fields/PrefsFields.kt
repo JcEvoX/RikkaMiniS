@@ -7,12 +7,22 @@ import com.rikkaminis.app.config.ConfigField
 import com.rikkaminis.app.config.ConfigRisk
 import com.rikkaminis.app.config.ConfigSchema
 import com.rikkaminis.app.config.ConfigValue
+import com.rikkaminis.app.config.PrefsWriteBus
 
 /**
  * Convenience wrappers for the most common backend (SharedPreferences).
  * Mirror iOS `AppStorage*Field`s. Add new variants here when a new
  * primitive type starts to recur — the bridge cares only about the
  * [ConfigValue] shape, so wrappers translate.
+ *
+ * [dv29-A4] Every `write()` ends with [PrefsWriteBus.publish]. A new variant
+ * must do the same: `apply()` alone only reaches consumers that happen to
+ * receive the SharedPreferences change callback, and on the device it did not
+ * reach them at all (`minis-config set background.overlay true` persisted while
+ * `AgentForegroundService` kept the old flag). Publishing hands the value to
+ * the registered sinks directly, so delivery no longer depends on that
+ * callback firing. `scripts/scan/prefs_listener_holder_guard.py` [dv29-a4]
+ * fails the build when a writer skips it.
  */
 
 class PrefsBoolField(
@@ -35,6 +45,7 @@ class PrefsBoolField(
         valueSchema.validate(value)
         val b = (value as ConfigValue.Bool).value
         prefs.edit().putBoolean(key, b).apply()
+        PrefsWriteBus.publish(prefs, key)
     }
 }
 
@@ -61,6 +72,7 @@ class PrefsIntField(
         valueSchema.validate(value)
         val i = (value as ConfigValue.Int).value
         prefs.edit().putInt(key, i).apply()
+        PrefsWriteBus.publish(prefs, key)
     }
 }
 class PrefsStringField(
@@ -85,6 +97,7 @@ class PrefsStringField(
         valueSchema.validate(value)
         val s = (value as ConfigValue.Str).value
         prefs.edit().putString(key, s).apply()
+        PrefsWriteBus.publish(prefs, key)
     }
 }
 
@@ -119,5 +132,6 @@ class PrefsIntCodedEnumField(
         val idx = cases.indexOf(s)
         if (idx < 0) throw ConfigError.InvalidValue("must be one of: ${cases.joinToString(", ")}")
         prefs.edit().putInt(key, idx).apply()
+        PrefsWriteBus.publish(prefs, key)
     }
 }

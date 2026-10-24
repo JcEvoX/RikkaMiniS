@@ -92,6 +92,7 @@ import com.rikkaminis.app.ui.media.InlineVideoPlayer
 import com.rikkaminis.app.ui.preview.ReleaseStep
 import com.rikkaminis.app.ui.preview.WebViewReleaseLatch
 import com.rikkaminis.app.ui.preview.releasePlan
+import com.rikkaminis.app.util.ExternalIntent
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -121,6 +122,14 @@ fun FilePreviewScreen(
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
+
+    // [deep-audit-1049 B-05] The print slot is module-level state, so nothing
+    // tore it down when the preview was left: a printed file kept its renderer
+    // alive for the rest of the process. Releasing here bounds it to the
+    // screen; a job that is still spooling is skipped (see the releaser).
+    DisposableEffect(Unit) {
+        onDispose { releasePrintWebViewIfNotSpooling() }
+    }
 
     // T-android-preview-title-toggle-path: tap the title to swap between
     // file name and absolute path. Mirrors the iOS preview's tap-to-toggle
@@ -1252,9 +1261,22 @@ private fun openExternally(context: Context, item: FileItem, mime: String) {
         val intent = Intent(Intent.ACTION_VIEW).apply {
             setDataAndType(uri, mime)
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         }
-        context.startActivity(Intent.createChooser(intent, "Open with…"))
+        // [deep-audit-1049 B-03] The chooser is what gets started, and it does
+        // not inherit the inner intent's flags — the hand-rolled version left
+        // NEW_TASK on the inner intent only. The chooser label moves from a
+        // hard-coded English literal to the existing localized string.
+        ExternalIntent.share(
+            context,
+            intent,
+            context.getString(R.string.filepreview_open_externally),
+        ) {
+            Toast.makeText(
+                context,
+                context.getString(R.string.filepreview_no_app),
+                Toast.LENGTH_SHORT,
+            ).show()
+        }
     } catch (e: Exception) {
         AppLogger.warning("FilePreview", "openExternally failed: ${e.message}")
         Toast.makeText(context, context.getString(R.string.filepreview_no_app), Toast.LENGTH_SHORT).show()
@@ -1364,7 +1386,19 @@ private fun shareFile(context: Context, item: FileItem) {
             putExtra(Intent.EXTRA_STREAM, uri)
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
         }
-        context.startActivity(Intent.createChooser(intent, context.getString(R.string.file_share_chooser_title)))
+        // [deep-audit-1049 B-03] Shared launcher: NEW_TASK lands on the
+        // chooser (the intent that is actually started) instead of nowhere.
+        ExternalIntent.share(
+            context,
+            intent,
+            context.getString(R.string.file_share_chooser_title),
+        ) { t ->
+            Toast.makeText(
+                context,
+                context.getString(R.string.file_share_failed_toast, t.message ?: ""),
+                Toast.LENGTH_SHORT,
+            ).show()
+        }
     } catch (e: Exception) {
         AppLogger.warning("FilePreview", "share failed for ${item.name}: ${e.message}")
         Toast.makeText(context, context.getString(R.string.file_share_failed_toast, e.message ?: ""), Toast.LENGTH_SHORT).show()
@@ -1397,19 +1431,26 @@ private fun printFile(context: Context, item: FileItem, preRenderedHtml: String?
     //
     // A *field* does create a GC root, so `printWebView` below is the real
     // version of that intent. It is deliberately NOT destroyed in
-    // `onPageFinished` and NOT destroyed by the next print either:
-    // `createPrintDocumentAdapter` hands the framework an adapter that reads
-    // this WebView lazily for as long as the job is spooling, and nothing tells
-    // us when that ends. Destroying on the success path (or on the next call)
-    // would silently produce blank printouts whenever a job outlives its call.
-    // The single slot bounds the retention to one view — see the ponytail note
-    // on the field.
+    // `onPageFinished`: `createPrintDocumentAdapter` hands the framework an
+    // adapter that reads this WebView lazily for as long as the job is
+    // spooling, and nothing tells us when that ends. Destroying on the success
+    // path would silently produce blank printouts whenever a job outlives its
+    // call.
+    //
+    // [deep-audit-1049 B-05] The slot IS released before the next print claims
+    // it, and on preview exit — but only when the current view has not started
+    // spooling yet (`releasePrintWebViewIfNotSpooling`). A spooling view keeps
+    // the old "bounded to whatever is still printing" behaviour; what no longer
+    // happens is the double dialog, because `onPageFinished` now refuses to
+    // start a job for a view that is no longer the slot owner.
     try {
+        releasePrintWebViewIfNotSpooling()
         val webView = WebView(context).apply {
             settings.javaScriptEnabled = false
             settings.allowFileAccess = true
         }
         printWebView = webView
+        printWebViewSpooling = false
         webView.webViewClient = object : SafeWebViewClient() {
             /**
              * [GH#341] Renderer died mid-print. The print job cannot proceed —
@@ -1426,6 +1467,22 @@ private fun printFile(context: Context, item: FileItem, preRenderedHtml: String?
             }
 
             override fun onPageFinished(view: WebView, url: String) {
+                // [deep-audit-1049 B-05] A superseded view must not pull a
+                // print job. Its page keeps loading after the slot was claimed
+                // by a newer print, and the old code started a second dialog
+                // from here whose adapter `releasePrintWebView(view)` could no
+                // longer reach (the identity check made it a no-op), leaving
+                // both the dialog and the renderer behind. Never spooling means
+                // this view can be torn down immediately.
+                if (printWebView !== view) {
+                    AppLogger.warning(
+                        "FilePreview",
+                        "print page finished for a superseded view: ${item.name}",
+                    )
+                    destroyPrintWebView(view)
+                    return
+                }
+                printWebViewSpooling = true
                 val printManager =
                     context.getSystemService(Context.PRINT_SERVICE) as PrintManager
                 val jobName = "${context.getString(R.string.app_name)} - ${item.name}"
@@ -1468,25 +1525,40 @@ private fun printFile(context: Context, item: FileItem, preRenderedHtml: String?
  * field (not a local) is what makes it an actual GC root; see the note in
  * [printFile] for why it outlives `onPageFinished`.
  *
- * ponytail: 单槽，成功路径不销毁 | 天花板: 打印期间保留 1 个 WebView；连续打印
- * 时旧实例会被新实例覆盖（不累积，但旧的渲染器要到 GC 才回收）| 升级触发:
+ * ponytail: 单槽，打印中不销毁 | 天花板: 一次打印作业 spool 期间再点打印，前一个
+ * WebView 无法安全销毁（销毁 = 空白纸），会留到 GC；非 spool 的旧实例在下次打印
+ * 前与退出预览时都会被释放（[releasePrintWebViewIfNotSpooling]）| 升级触发:
  * PrintManager 提供作业完成回调，或出现「打印相关 WebView 驻留」的内存报告。
  */
 private var printWebView: WebView? = null
 
 /**
+ * [deep-audit-1049 B-05] Whether [printWebView] has already handed its adapter
+ * to PrintManager. A spooling view is still being read by the framework, so it
+ * is the one instance that must NOT be destroyed.
+ */
+private var printWebViewSpooling = false
+
+/**
+ * [deep-audit-1049 B-05] Decision behind [releasePrintWebViewIfNotSpooling],
+ * pulled out so a JVM test can pin the branch (the WebView itself is
+ * Android-only). Pure: the caller supplies the two facts.
+ */
+internal fun shouldReleasePrintSlot(hasSlot: Boolean, slotSpooling: Boolean): Boolean =
+    hasSlot && !slotSpooling
+
+/**
  * [fix/render-ui F-274] Drop the reference and tear the renderer down. Called
- * on a load failure, and at the start of the next print. `destroy()` on an
+ * on a load failure, by [releasePrintWebViewIfNotSpooling] before a new print
+ * claims the slot, and when the preview screen goes away. `destroy()` on an
  * already-destroyed WebView is a no-op, and the identity check makes a stale
  * callback from a superseded view safe.
  */
 private fun releasePrintWebView() {
     val view = printWebView ?: return
     printWebView = null
-    runCatching {
-        view.stopLoading()
-        view.destroy()
-    }
+    printWebViewSpooling = false
+    destroyPrintWebView(view)
 }
 
 /**
@@ -1495,7 +1567,37 @@ private fun releasePrintWebView() {
  * newer print is using.
  */
 private fun releasePrintWebView(view: WebView) {
-    if (printWebView === view) releasePrintWebView()
+    if (isCurrentPrintView(printWebView, view)) releasePrintWebView()
+}
+
+/**
+ * [deep-audit-1049 B-05] Identity, not equality: two WebViews that would
+ * compare "equal" are still different renderers, and releasing the wrong one
+ * blanks the job the other is spooling. Pure so the identity semantics the
+ * whole slot guard rests on are pinned on the JVM.
+ */
+internal fun isCurrentPrintView(owner: Any?, candidate: Any?): Boolean =
+    owner != null && owner === candidate
+
+/**
+ * [deep-audit-1049 B-05] Release the slot before it is re-claimed (a new print)
+ * or abandoned (the preview screen exits) — the contract [releasePrintWebView]
+ * always documented but nothing called. A view whose job is already spooling is
+ * skipped: `createPrintDocumentAdapter` reads it lazily, so destroying it here
+ * would print blank pages.
+ */
+private fun releasePrintWebViewIfNotSpooling() {
+    if (shouldReleasePrintSlot(printWebView != null, printWebViewSpooling)) {
+        releasePrintWebView()
+    }
+}
+
+/** Tear down one WebView that no print job depends on any more. */
+private fun destroyPrintWebView(view: WebView) {
+    runCatching {
+        view.stopLoading()
+        view.destroy()
+    }
 }
 
 /**

@@ -701,7 +701,7 @@ def check_handoff_src(rel, text):
     return problems
 
 
-def check_handoff(root):
+def check_handoff(root, stats=None):
     problems = []
     for rel in SHARE_FILES:
         try:
@@ -711,6 +711,276 @@ def check_handoff(root):
             problems.append("[C-NT] %s: file missing (was it renamed/moved?)" % rel)
             continue
         problems.extend(check_handoff_src(rel, text))
+    problems.extend(check_derived_handoff(root, stats))
+    return problems
+
+
+# ── [deep-audit-1049 B-03] the DERIVED share/open hand-off surface ──────────
+#
+# arm6 above pins three files BY NAME — the three the 1048 wave happened to
+# audit. The next share entry point was therefore invisible, which is the N+1
+# shape this gate has already re-learned twice (arm1's `"shared"` hole, arm5's
+# filesDir growers). This arm derives its subject set from the tree instead:
+# every .kt under src/main/java that either builds a system chooser or hands a
+# URI-granting intent to startActivity().
+#
+# C-NT        every `Intent.createChooser(` statement carries
+#             FLAG_ACTIVITY_NEW_TASK — on the statement, through
+#             `<chooser>.addFlags(…)` in the same function, or (new) through the
+#             shared `ExternalIntent` launcher, whose own chooser does. An
+#             `Intent.createChooser` does NOT inherit the inner intent's flags:
+#             the six 1049 entry points had one flag on the inner intent, one on
+#             neither, and one on each — only the Activity-context callers got
+#             away with it, and `AndroidRuntimeException` from a Service /
+#             Application context is an `Error`, not a catchable exception.
+# C-FEEDBACK  a `try { … startActivity … } catch { }` around a URI hand-off must
+#             report the failure (Toast / Snackbar / AppLogger / Log). An empty
+#             or comment-only catch is precisely the report "tapping share does
+#             nothing". Containment itself (a bare startActivity with no
+#             runCatching/try) stays arm6's stricter criterion on the three
+#             named files — requiring it tree-wide would flag Activity-internal
+#             launches that cannot throw.
+SRC_MAIN_REL = "src/android/app/src/main/java"
+HANDOFF_CHOOSER = re.compile(r"Intent\s*\.\s*createChooser\s*\(")
+HANDOFF_START = re.compile(r"\bstartActivity\s*\(")
+HANDOFF_GRANT = "FLAG_GRANT_READ_URI_PERMISSION"
+HANDOFF_TRY = re.compile(r"(?<![\w.])try\s*\{")
+HANDOFF_CATCH = re.compile(r"\bcatch\s*(?:\([^)]*\))?\s*\{")
+# AppLogger / Toast / Snackbar live in FEEDBACK_TOKENS; the bare android.util
+# Log spellings are just as visible in logcat, so they count too.
+HANDOFF_FEEDBACK = FEEDBACK_TOKENS + ("Log.w(", "Log.e(", "Log.i(", "Log.d(")
+
+
+def derive_handoff_files(root):
+    """Every production source that hands something to another app."""
+    out = []
+    base = os.path.join(root, SRC_MAIN_REL)
+    if not os.path.isdir(base):
+        return out
+    for dirpath, dirnames, filenames in os.walk(base):
+        dirnames.sort()
+        for name in sorted(filenames):
+            if not name.endswith(".kt"):
+                continue
+            path = os.path.join(dirpath, name)
+            try:
+                with open(path, encoding="utf-8") as fh:
+                    text = fh.read()
+            except OSError:
+                continue
+            # Use the offset-preserving stripper: the shared one loses text on
+            # some Kotlin shapes (BrowserDownloadsSheet.kt came out 2.5 KB short
+            # with every `createChooser` gone), which silently shrank this set.
+            code = _strip_comments_keep_offsets(text)
+            if HANDOFF_CHOOSER.search(code) or (
+                HANDOFF_START.search(code) and HANDOFF_GRANT in code
+            ):
+                out.append(os.path.relpath(path, root).replace(os.sep, "/"))
+    return out
+
+
+def _paren_end(text, open_idx):
+    """Index just past the `)` matching the `(` at [open_idx], or -1."""
+    depth = 0
+    for j in range(open_idx, len(text)):
+        if text[j] == "(":
+            depth += 1
+        elif text[j] == ")":
+            depth -= 1
+            if depth == 0:
+                return j + 1
+    return -1
+
+
+def _strip_comments_keep_offsets(text):
+    """Comment stripper that preserves byte offsets AND line numbers.
+
+    The shared [strip_comments] collapses comments, so an index into its output
+    cannot be reported as a source line (`MainActivity.kt:380` was really line
+    421). Every offset in this arm is a span of [text]; blanking comments in
+    place is what makes the locations actionable.
+    """
+    out = list(text)
+    i, n = 0, len(text)
+    while i < n:
+        if text.startswith("//", i):
+            while i < n and text[i] != "\n":
+                out[i] = " "
+                i += 1
+        elif text.startswith("/*", i):
+            while i < n and not text.startswith("*/", i):
+                if text[i] != "\n":
+                    out[i] = " "
+                i += 1
+            for j in range(i, min(i + 2, n)):
+                out[j] = " "
+            i += 2
+        elif text[i] == '"':
+            j = i + 1
+            while j < n and text[j] != '"':
+                if text[j] == "\\":
+                    j += 1
+                if j < n and text[j] != "\n":
+                    out[j] = " "
+                j += 1
+            if j < n:
+                out[j] = " "
+            i = j + 1
+        else:
+            i += 1
+    return "".join(out)
+
+
+def _handoff_is_uri_handooff(code, idx, lookback_lines=25):
+    """True when the `startActivity` at [idx] hands a local file to another app.
+
+    The signal is a URI grant on the started intent. A chooser carries the grant
+    on the INNER intent a few lines up, so a bounded look-back is part of the
+    window; an unbounded "the enclosing function grants something" test instead
+    swept in MainActivity's settings-panel launches, whose `catch` is an OEM
+    comment and whose intent grants nothing.
+    """
+    if HANDOFF_GRANT in _statement(code, idx):
+        return True
+    lo = idx
+    for _ in range(lookback_lines):
+        nl = code.rfind("\n", 0, lo)
+        if nl < 0:
+            lo = 0
+            break
+        lo = nl
+    return HANDOFF_GRANT in code[lo:idx]
+
+
+def check_derived_handoff_src(rel, text):
+    code = _strip_comments_keep_offsets(text)
+    problems = []
+    chooser_sites = 0
+    for m in HANDOFF_CHOOSER.finditer(code):
+        chooser_sites += 1
+        stmt = _statement(code, m.start())
+        if "FLAG_ACTIVITY_NEW_TASK" in stmt:
+            continue
+        var = re.match(r"\s*val\s+(\w+)\s*=", stmt)
+        fn = _enclosing_fun(code, m.start())
+        body = code[fn[1]: fn[2]] if fn else ""
+        if var and re.search(
+            r"\b%s\s*\.\s*addFlags\s*\([^)]*FLAG_ACTIVITY_NEW_TASK" % re.escape(var.group(1)),
+            body,
+        ):
+            continue
+        problems.append(
+            "[C-NT] %s:%d: a chooser is started without FLAG_ACTIVITY_NEW_TASK — a "
+            "chooser does not inherit the inner intent's flags"
+            % (rel, code.count("\n", 0, m.start()) + 1)
+        )
+    launches = [m for m in HANDOFF_START.finditer(code)]
+    for m in launches:
+        # C-NT-ARG: a URI hand-off that is started directly (no chooser) must
+        # carry the flag on the intent it starts. The resolver looks at the
+        # argument expression and, when that is a bare identifier, at the local
+        # `val` that built it (+ any `ident.addFlags(...)` right after). A value
+        # returned by a helper cannot be judged here and is skipped — C-NT above
+        # still pins the chooser such a helper returns.
+        if not _handoff_is_uri_handooff(code, m.start()):
+            continue
+        arg_end = _paren_end(code, m.end() - 1)
+        arg = code[m.start(): arg_end] if arg_end > 0 else ""
+        if "FLAG_ACTIVITY_NEW_TASK" not in arg:
+            bare = re.match(r"startActivity\s*\(\s*([A-Za-z_]\w*)\s*\)", arg)
+            resolved = None
+            if bare:
+                ident = bare.group(1)
+                for k in range(m.start(), -1, -1):
+                    decl = re.search(r"\b(?:val|var)\s+" + re.escape(ident) + r"\s*=", code[k:k + 80])
+                    if decl:
+                        at = k + decl.start()
+                        resolved = _statement(code, at)
+                        # `ident.addFlags(...)` on its own line right after
+                        tail = code[at: at + 4000]
+                        for extra in re.finditer(
+                            r"\b%s\s*\.\s*addFlags\s*\([^)]*FLAG_ACTIVITY_NEW_TASK" % re.escape(ident),
+                            tail,
+                        ):
+                            resolved += " FLAG_ACTIVITY_NEW_TASK"
+                            break
+                        break
+            if resolved is None:
+                continue
+            if "FLAG_ACTIVITY_NEW_TASK" not in resolved:
+                problems.append(
+                    "[C-NT] %s:%d: a URI hand-off is started without "
+                    "FLAG_ACTIVITY_NEW_TASK on the intent it starts (the flag does not "
+                    "travel from an inner intent)" % (rel, code.count("\n", 0, m.start()) + 1)
+                )
+    for m in launches:
+        if not _handoff_is_uri_handooff(code, m.start()):
+            continue
+        span = None
+        for t in HANDOFF_TRY.finditer(code):
+            if t.start() > m.start():
+                break
+            ob = code.find("{", t.end() - 1)
+            cb = _brace_end(code, ob) if ob >= 0 else None
+            if cb is None or cb < m.start():
+                continue
+            if span is None or ob > span[0]:
+                span = (ob, cb)
+        if span is None:
+            continue  # containment is arm6's criterion on the named files
+        cm = HANDOFF_CATCH.search(code[span[1]: span[1] + 400])
+        if cm is None:
+            continue  # try/finally, no catch to judge
+        cob = code.find("{", span[1] + cm.start())
+        ccb = _brace_end(code, cob) if cob >= 0 else None
+        if ccb is None:
+            problems.append("[C-FEEDBACK] %s:%d: unparsable catch block — fail-closed"
+                            % (rel, code.count("\n", 0, m.start()) + 1))
+            continue
+        body = code[cob + 1: ccb].strip()
+        if not body:
+            problems.append(
+                "[C-FEEDBACK] %s:%d: the failure of a file share is swallowed — the "
+                "catch body is empty (no user feedback, no log)"
+                % (rel, code.count("\n", 0, m.start()) + 1)
+            )
+        elif not any(tok in body for tok in HANDOFF_FEEDBACK):
+            problems.append(
+                "[C-FEEDBACK] %s:%d: the catch around a file share reports nothing "
+                "visible (no Toast / Snackbar / AppLogger / Log)"
+                % (rel, code.count("\n", 0, m.start()) + 1)
+            )
+    return problems, chooser_sites, len(launches)
+
+
+def check_derived_handoff(root, stats=None):
+    """(problems, stats) for the tree-derived share/open surface.
+
+    [stats] (an optional dict) receives the counted surface, so a green run can
+    still say WHAT it looked at — a criterion that silently sees zero sites is
+    indistinguishable from a clean tree, and that is how these arms rot.
+    """
+    problems = []
+    files = [f for f in derive_handoff_files(root) if f not in SHARE_FILES]
+    choosers = launches = 0
+    for rel in files:
+        try:
+            with open(os.path.join(root, rel), encoding="utf-8") as fh:
+                text = fh.read()
+        except OSError:
+            problems.append("[C-NT] %s: file vanished between walk and read" % rel)
+            continue
+        p, c, l = check_derived_handoff_src(rel, text)
+        problems.extend(p)
+        choosers += c
+        launches += l
+    if stats is not None:
+        stats["files"] = len(files)
+        stats["choosers"] = choosers
+        stats["launches"] = launches
+    if not files:
+        problems.append("[C-NT] no share/open hand-off source found under %s — the "
+                        "derived surface went blind (paths moved?)" % SRC_MAIN_REL)
     return problems
 
 
@@ -1174,6 +1444,82 @@ def selftest():
             ok = False
     print("SHARE_HANDOFF_SELFTEST=" + ("PASS" if ok else "FAIL"))
 
+    # ── [deep-audit-1049 B-03] arm6b: the DERIVED hand-off surface ─────────
+    # Fixtures are whole source files; the expected problem CODE SET is written
+    # by hand here (never derived from a run), so a criterion that stops biting
+    # shows up as a mismatch instead of a silent pass.
+    handoff_clean = "\n".join([
+        'package fixture',
+        '',
+        'import android.content.Context',
+        'import android.content.Intent',
+        'import android.widget.Toast',
+        '',
+        'private fun shareIt(context: Context, uri: android.net.Uri) {',
+        '    val intent = Intent(Intent.ACTION_SEND).apply {',
+        '        type = "text/plain"',
+        '        putExtra(Intent.EXTRA_STREAM, uri)',
+        '        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)',
+        '    }',
+        '    val chooser = Intent.createChooser(intent, "share")',
+        '    chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)',
+        '    try {',
+        '        context.startActivity(chooser)',
+        '    } catch (t: Throwable) {',
+        '        Toast.makeText(context, "share failed", Toast.LENGTH_SHORT).show()',
+        '    }',
+        '}',
+        '',
+    ])
+    handoff_no_flag = handoff_clean.replace(
+        "    chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)\n", "")
+    handoff_empty_catch = handoff_clean.replace(
+        '        Toast.makeText(context, "share failed", Toast.LENGTH_SHORT).show()\n', "")
+    handoff_comment_catch = handoff_clean.replace(
+        '        Toast.makeText(context, "share failed", Toast.LENGTH_SHORT).show()',
+        '        // some devices have no share target')
+    handoff_println_catch = handoff_clean.replace(
+        '        Toast.makeText(context, "share failed", Toast.LENGTH_SHORT).show()',
+        '        println("failed")')
+    handoff_applogger_catch = handoff_clean.replace(
+        '        Toast.makeText(context, "share failed", Toast.LENGTH_SHORT).show()',
+        '        AppLogger.warning("Share", "failed: ${t.message}")')
+    handoff_log_catch = handoff_clean.replace(
+        '        Toast.makeText(context, "share failed", Toast.LENGTH_SHORT).show()',
+        '        android.util.Log.w("Share", "failed: ${t.message}")')
+    handoff_apply_flag = handoff_clean.replace(
+        '    val chooser = Intent.createChooser(intent, "share")\n'
+        '    chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)',
+        '    val chooser = Intent.createChooser(intent, "share").apply {\n'
+        '        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)\n'
+        '    }')
+    for arm_name, sample, want in (
+        ("b03-compliant", handoff_clean, set()),
+        ("b03-compliant apply-block flag", handoff_apply_flag, set()),
+        ("b03-precision AppLogger catch", handoff_applogger_catch, set()),
+        ("b03-precision android Log catch", handoff_log_catch, set()),
+        ("b03-chooser without NEW_TASK", handoff_no_flag, {"[C-NT]"}),
+        ("b03-empty catch", handoff_empty_catch, {"[C-FEEDBACK]"}),
+        ("b03-comment-only catch", handoff_comment_catch, {"[C-FEEDBACK]"}),
+        ("b03-catch that prints nowhere", handoff_println_catch, {"[C-FEEDBACK]"}),
+    ):
+        got, _choosers, _launches = check_derived_handoff_src("Fixture.kt", sample)
+        codes = {g.split("]")[0] + "]" for g in got}
+        if codes == want:
+            print("  SELFTEST %s: OK (%s)" % (arm_name, sorted(codes) or "green"))
+        else:
+            print("  SELFTEST %s: FAIL (want %s, got %s)" % (arm_name, sorted(want), got))
+            ok = False
+    # fail-closed: a tree with no share source at all must RED, not pass silently
+    with tempfile.TemporaryDirectory() as tmp:
+        blind = check_derived_handoff(tmp)
+        if blind and "[C-NT]" in blind[0]:
+            print("  SELFTEST b03-failclosed empty tree: OK")
+        else:
+            print("  SELFTEST b03-failclosed empty tree: FAIL (got %r)" % (blind,))
+            ok = False
+    print("SHARE_HANDOFF_DERIVED_SELFTEST=" + ("PASS" if ok else "FAIL"))
+
     print("SHARE_DIR_PRUNE_SELFTEST=" + ("PASS" if ok else "FAIL"))
     return 0 if ok else 1
 
@@ -1195,7 +1541,13 @@ def main():
     a3 = check_arm3(root)
     if a3:
         failures.append(f"arm3 (cacheDir/shared writers must be suspend + IO + prune): {a3}")
-    a6 = check_handoff(root)
+    handoff_stats = {}
+    a6 = check_handoff(root, handoff_stats)
+    if handoff_stats:
+        print("  [handoff] %d derived source(s) (3 named + %d), %d chooser site(s), "
+              "%d startActivity site(s)"
+              % (3 + handoff_stats.get("files", 0), handoff_stats.get("files", 0),
+                 handoff_stats.get("choosers", 0), handoff_stats.get("launches", 0)))
     if a6:
         failures.append(f"arm6 (share hand-off: flags + verdict + feedback): {a6}")
     a4 = check_arm4(root)

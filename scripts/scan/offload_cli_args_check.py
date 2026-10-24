@@ -104,6 +104,23 @@ Exit 0 = pass, 1 = violation (or selftest failure).
      listed: a literal 0, a `const val … = 0` name, and `if (<token count>)
      2 else 0` (DebugOffloadHandler's shape) all pass.
 
+[dv29-A3 A-05] addition (the page-size contract, over every surface):
+
+ 14. `1048-A06` gave `android-contacts` a page-size resolver that refuses
+     `--max abc` / `--max 0` (exit 2) and pinned it as CN0-CN4 over the contacts
+     source. The four siblings kept `getInt(...) ?: default` / `.coerceIn(1, ...)`,
+     so the same three defects stayed reachable: calendar answered `--limit -5`
+     with exit 0, an empty page and a "-5 of 0 total records" warning; photos
+     answered `--limit 0` with one row; sessions answered `--limit 1000` with
+     100 rows; notification answered `--max abc` with every notification. The
+     contract now lives in ONE file (`OffloadPageSize.kt`), whose SURFACES
+     registry names each surface's handler - the gate derives its scope from
+     there, so a new paginating handler cannot escape (PG0), a registered
+     handler may not read/default/clamp a page size itself (PG2, whitelist = the
+     empty set), the resolver must keep all five refusals and answer the default
+     last (PG3), a refusal must reach the caller as a usage error (PG4), and the
+     legacy `-n` alias must stay refused (PG5).
+
 Success marker on selftest: OFFLOAD_CLI_ARGS_SELFTEST=PASS
 
 [dv19-A1] additions (the same defect family one layer up: a decision read from
@@ -1449,13 +1466,45 @@ def _fn_bodies_with_sigs(code: str):
     return out
 
 
-def _contacts_page_resolver(code: str):
-    """The ONE page-size resolver: takes a `default`, reads the `max` CLI key."""
-    return [
-        (name, params, ret, body)
-        for name, params, ret, body in _fn_bodies_with_sigs(code)
-        if body and "default" in params and '"max"' in body
-    ]
+# ── [dv29-A3 A-05] the page-size contract, over EVERY registered surface ────
+#
+# [dv28-A6 A-06] closed this contract for `android-contacts` alone and pinned it
+# with CN0-CN4, whose scope was the contacts source handed to the check. Four
+# sibling paginating handlers kept the older shape and the same three defects
+# stayed reachable from the release CLI (verified on-device, 2026-10-24,
+# app 1.0.0+2597): `android-calendar list --limit -5` answered exit 0 with an
+# empty page plus a "-5 of 0 total records" truncation warning; `--limit 0`
+# answered ONE row (photos); `--limit 1000` answered 100 rows (sessions);
+# `--max abc` answered every active notification.
+#
+# The contract now lives in ONE file (`OffloadPageSize.kt`) whose SURFACES
+# registry names the handler that owns each surface. The gate's scope is DERIVED
+# from that registry, not from a file list written here: a new paginating handler
+# must be declared there, a declared surface missing from SURFACES is red, and a
+# registered handler that reads a page size raw is red with no exemption list.
+#
+# PG0 fail-closed derivation · PG1 the handler routes through the resolver ·
+# PG2 no raw page-size read survives in a registered handler (whitelist = the
+# empty set) · PG3 the resolver keeps its refusals (raw read, bare flag,
+# non-numeric, lower bound, upper bound, exactly one default answered last) ·
+# PG4 a refusal is answered as a usage error, never as a default page ·
+# PG5 the legacy `-n` alias is still refused instead of leaking into a query.
+
+PAGE_OUTCOME = "PageSizeOutcome"
+
+# Shapes that read a page size WITHOUT validating it. Ordered strongest first so
+# a finding names the site it was read at.
+_PAGE_RAW_READS = [
+    (re.compile(r'\bgetInt\s*\(\s*"(?:limit|max)"'), 'getInt on a page-size flag'),
+    (
+        re.compile(r'\bget\s*\(\s*"(?:limit|max)"\s*\)[^\n]*?toIntOrNull'),
+        'raw toIntOrNull on a page-size flag',
+    ),
+    (
+        re.compile(r'(?:limit|max)[^\n]{0,40}?\.coerce(?:In|AtLeast)\s*\(\s*1\s*[,)]'),
+        'a clamped page size',
+    ),
+]
 
 
 def _exit2_producers(code: str) -> set:
@@ -1466,133 +1515,287 @@ def _exit2_producers(code: str) -> set:
     }
 
 
-def check_contacts_page_size(contacts_src: str) -> list:
-    """[dv28-A6 A-06] CN1-CN4 — see the block comment above."""
+def _page_line(raw: str, snippet: str = "") -> str:
+    """`(line N)` for the first occurrence of `snippet`, or ''."""
+    if not snippet:
+        return ""
+    idx = raw.find(snippet)
+    if idx < 0:
+        return ""
+    return f" (line {raw[:idx].count(chr(10)) + 1})"
+
+
+def _page_declared_surfaces(code: str) -> list:
+    """[{name, file, legacy}] for every `val X = PageSizeSurface(…)` declaration."""
+    out = []
+    for m in re.finditer(
+        r"\bval\s+(\w+)\s*(?::\s*[\w.]+\s*)?=\s*PageSizeSurface\s*\(", code
+    ):
+        open_idx = code.index("(", m.end() - 1)
+        depth, k = 0, open_idx
+        while k < len(code):
+            if code[k] == "(":
+                depth += 1
+            elif code[k] == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+            k += 1
+        block = code[open_idx + 1:k]
+        file_m = re.search(r'handlerFile\s*=\s*"([^"]+)"', block)
+        legacy_m = re.search(r"legacyShortMax\s*=\s*(true|false)", block)
+        out.append({
+            "name": m.group(1),
+            "file": file_m.group(1) if file_m else "",
+            "legacy": bool(legacy_m and legacy_m.group(1) == "true"),
+        })
+    return out
+
+
+def _page_registered(code: str):
+    """The names listed in `val SURFACES = listOf(…)`, or None when absent."""
+    m = re.search(r"\bval\s+SURFACES\s*(?::\s*[\w.<>]+\s*)?=\s*listOf\(([^)]*)\)", code)
+    if not m:
+        return None
+    return [t.strip() for t in m.group(1).split(",") if t.strip()]
+
+
+def check_offload_page_size(sources: dict) -> list:
+    """PG0-PG5 — see the block comment above. `sources` maps file name → text."""
     findings = []
-    code = code_only(contacts_src)
-    resolvers = _contacts_page_resolver(code)
-    if len(resolvers) != 1:
+    codes = {name: code_only(src) for name, src in sources.items()}
+
+    # ── PG0: derive the resolver and its scope, fail-closed ────────────────
+    resolver_files = [
+        name for name, code in codes.items()
+        if re.search(r"sealed class\s+" + PAGE_OUTCOME + r"\b", code)
+        and re.search(r"\bfun\s+resolve\s*\(", code)
+    ]
+    if len(resolver_files) != 1:
         findings.append(
-            ("CN0", f"{len(resolvers)} page-size resolver(s)",
-             "exactly one function (a `default` parameter + the `max` CLI key) "
-             "must resolve the page size"))
+            ("PG0", f"{len(resolver_files)} page-size resolver(s)",
+             "exactly one file must declare the shared resolver "
+             f"(a sealed {PAGE_OUTCOME} plus `fun resolve`) — the gate derives "
+             "every other rule from it"))
         return findings
-    name, _params, ret, body = resolvers[0]
+    resolver_name = resolver_files[0]
+    rcode = codes[resolver_name]
+    raw_resolver = sources[resolver_name]
 
-    sealed = bool(ret) and re.search(r"sealed class\s+" + re.escape(ret) + r"\b", code) is not None
-    variants = re.findall(
-        r"(?:data\s+)?(?:class|object)\s+(\w+)\s*(?:\([^)]*\))?\s*:\s*"
-        + re.escape(ret) + r"\(",
-        code,
-    ) if ret else []
-    refused = []
-    default_variant = None
-    if not sealed or len(variants) < 2:
+    bodies = [
+        (params, body) for name, params, _ret, body in _fn_bodies_with_sigs(rcode)
+        if name == "resolve" and body
+    ]
+    if len(bodies) != 1:
         findings.append(
-            ("CN1", "no two-outcome type",
-             f"the resolver's outcome type ({ret or 'none'}) must be a sealed type "
-             "with at least an ok and a refused variant"))
-    else:
-        defaults = list(re.finditer(r"return\s+([\w.]+)\s*\(\s*default\s*\)", body))
-        if len(defaults) != 1:
+            ("PG0", f"{len(bodies)} `resolve` bodies",
+             "the resolver must be one function with a readable body"))
+        return findings
+    params, body = bodies[0]
+    if "default" not in params:
+        findings.append(
+            ("PG0", "the resolver takes no default",
+             "the default must arrive as a parameter, so one surface can carry "
+             "two documented defaults"))
+
+    # The refusals may live in a helper the resolver calls (`checked()` in the
+    # shipped shape), so the teeth are judged over the CALL CLOSURE — a bounded
+    # one-hop-per-round walk, not a brace guess.
+    fns = {n: b for n, _p, _r, b in _fn_bodies_with_sigs(rcode) if b and n != "resolve"}
+    closure = body
+    included = set()
+    for _round in range(4):
+        added = False
+        for fn_name, fn_body in fns.items():
+            if fn_name in included:
+                continue
+            if re.search(r"\b" + re.escape(fn_name) + r"\s*\(", closure):
+                closure += "\n" + fn_body
+                included.add(fn_name)
+                added = True
+        if not added:
+            break
+
+    surfaces = _page_declared_surfaces(rcode)
+    if not surfaces:
+        findings.append(
+            ("PG0", "no declared surfaces",
+             "the resolver file must declare every surface it serves "
+             "(`val X = PageSizeSurface(handlerFile = …)`)"))
+        return findings
+    registered = _page_registered(rcode)
+    if registered is None:
+        findings.append(
+            ("PG0", "no SURFACES registry",
+             "`val SURFACES = listOf(…)` is what the gate's scope is derived "
+             "from — without it a declared surface escapes every rule"))
+        return findings
+    declared_names = [s["name"] for s in surfaces]
+    for name in declared_names:
+        if name not in registered:
             findings.append(
-                ("CN1", f"{len(defaults)} default answers",
-                 "exactly one return may answer the default (the last one, reached "
-                 "only when no page size was spelled)"))
+                ("PG0", f"surface `{name}` is declared but not registered",
+                 "add it to SURFACES: an unregistered surface is never checked"))
+    for name in registered:
+        if name not in declared_names:
+            findings.append(
+                ("PG0", f"SURFACES lists unknown `{name}`",
+                 "the registry names a surface that does not exist"))
+
+    owned = {}
+    for surface in surfaces:
+        if not surface["file"]:
+            findings.append(
+                ("PG0", f"surface `{surface['name']}` declares no handlerFile",
+                 "the gate derives its scope from handlerFile — without it the "
+                 "surface is checked nowhere"))
+        elif surface["file"] not in sources:
+            findings.append(
+                ("PG0", f"surface `{surface['name']}` names a missing handler",
+                 f"{surface['file']} is not part of the offload sources"))
         else:
-            default_variant = defaults[0].group(1)
-        refused = [v for v in variants if v != default_variant]
+            owned.setdefault(surface["file"], []).append(surface["name"])
 
-    # CN1 — the default may only answer an ABSENT option.
-    if re.search(r"\bgetInt\s*\(", body):
+    # ── PG3: the resolver keeps its refusals ──────────────────────────────
+    if re.search(r"\bgetInt\s*\(", rcode):
         findings.append(
-            ("CN1", "lossy integer read",
-             "the page size is read with getInt(...), which maps 'spelled but "
-             "unreadable' onto 'absent' — read the raw value and validate it"))
-    if re.search(r"hasFlag\([^)]*\"max\"", body) is None:
+            ("PG3", "lossy integer read in the resolver",
+             "the page size must be read as the RAW string: getInt maps "
+             "'spelled but unreadable' onto 'not spelled'"))
+    if "toIntOrNull" not in closure:
         findings.append(
-            ("CN1", "a bare --max is not refused",
-             "`--max` with no value binds no value at all (OffloadArgs files the "
-             "key as a flag), so the option's own presence must be checked or the "
+            ("PG3", "no non-numeric refusal",
+             "a spelled value that is not an integer must be refused, not "
+             "answered with the default"))
+    if not re.search(r"< 1\b|<=\s*0\b", closure):
+        findings.append(
+            ("PG3", "no positive lower bound",
+             "zero/negative must be refused before it reaches a collector "
+             "(a zero-row page reads as 'nothing there')"))
+    if not re.search(r"\.max\s*!=\s*null|\.max\s*\?\.|<=\s*\w*\.?max", closure):
+        findings.append(
+            ("PG3", "the declared upper bound is never compared",
+             "an out-of-range page must be refused, not clamped — a clamp "
+             "reports success for a request the handler did not honour"))
+    # The surface's OWN vocabulary must be consulted (a bare identifier — the
+    # loop variable over `surface.names`); a literal `hasFlag("n")` is the
+    # legacy-alias refusal and cannot satisfy this.
+    if not re.search(r"\.hasFlag\s*\(\s*[A-Za-z_]\w*\s*\)", body):
+        findings.append(
+            ("PG3", "a bare page-size flag is not refused",
+             "a spelling with no follower binds no value at all (OffloadArgs "
+             "files it as a flag): its presence must be consulted or the "
              "invocation silently answers the default"))
-    if default_variant is not None:
-        defaults = list(re.finditer(r"return\s+([\w.]+)\s*\(\s*default\s*\)", body))
-        constructed = [
-            (v, m.start())
-            for v in refused
-            for m in re.finditer(r"\b" + re.escape(v) + r"\s*\(", body)
-        ]
-        if not constructed:
-            findings.append(
-                ("CN1", "no refusal path",
-                 f"the resolver never constructs a refusal variant (of {refused}) — "
-                 "a spelled-but-unusable value would fall through to the default"))
-        elif defaults and min(i for _v, i in constructed) > defaults[0].start():
-            findings.append(
-                ("CN1", "default answered first",
-                 "the refusal path must be reached BEFORE the default answer"))
-
-    # CN2 — a surviving `-n` means "the value after it is not a number".
-    flag_at = re.search(r"hasFlag\([^)]*\"n\"", body)
-    if flag_at is None:
+    defaults = list(re.finditer(r"\b(?:Ok|Valid|OkValue)\s*\(\s*default\s*\)", body))
+    if len(defaults) != 1:
         findings.append(
-            ("CN2", "the -n flag is never consulted",
-             "a `-n` that survived the alias rewrite carries no number — it must "
-             "be refused here, or its token reaches the query slot"))
+            ("PG3", f"{len(defaults)} default answers",
+             "exactly one answer may use the default, and it must be the last "
+             "path (reached only when nothing was spelled)"))
     else:
-        tail = body[flag_at.end():]
-        if not any(re.search(r"\b" + re.escape(v) + r"\s*\(", tail) for v in refused):
+        refused = [
+            m for m in re.finditer(r"\bInvalid\s*\(", body)
+        ]
+        if not refused:
             findings.append(
-                ("CN2", "the -n branch does not refuse",
-                 "the `-n` branch must construct a refusal (that token is not a "
-                 "page size, and it must not be searched for)"))
-    if re.search(r"positional\.getOrNull\(\s*1\s*\)\s*\)?\s*\?\.\s*toInt", body):
-        findings.append(
-            ("CN2", "alias value recovered from the positional list",
-             "reading the -n value back out of positional[] is what let `-n abc` "
-             "leave \"abc\" in the query slot"))
+                ("PG3", "no refusal path",
+                 "the resolver never constructs a refusal — a spelled-but-"
+                 "unusable value would fall through to the default"))
+        elif min(m.start() for m in refused) > defaults[0].start():
+            findings.append(
+                ("PG3", "default answered first",
+                 "every refusal must be reached BEFORE the default answer"))
 
-    # CN3 — the resolved size must be positive and bounded; both numbers are
-    # derived from their declarations in the same file.
-    closure = body + "".join(
-        b for _n, _p, _r, b in _fn_bodies_with_sigs(code)
-        if b and re.search(r"\b" + re.escape(_n) + r"\s*\(", body)
+    variants = re.findall(
+        r"(?:data\s+)?class\s+(\w+)\s*\([^)]*\)\s*:\s*" + PAGE_OUTCOME + r"\(",
+        rcode,
     )
-    if not re.search(r"<\s*1\b|<=\s*0\b|!\s*in\s+1\s*\.\.", closure):
+    if len(variants) < 2:
         findings.append(
-            ("CN3", "no positive lower bound",
-             "a zero/negative page size must be refused before it reaches "
-             "collectContactPage (an empty page reads as 'no contacts')"))
-    bounds = re.findall(r"const val\s+(\w*MAX\w*)\s*=\s*(\d+)", code)
-    if not bounds:
-        findings.append(
-            ("CN3", "no declared upper bound",
-             "the page size must be bounded by a named constant"))
-    elif not any(nm in closure and ">" in closure for nm, _v in bounds):
-        findings.append(
-            ("CN3", "the upper bound is never compared",
-             f"the declared bound(s) {[nm for nm, _v in bounds]} must be compared "
-             "against the resolved size"))
+            ("PG3", f"{len(variants)} outcome variant(s)",
+             f"the {PAGE_OUTCOME} type needs at least an ok and a refused "
+             "variant, so 'could not honour it' is expressible"))
 
-    # CN4 — every subcommand that collects a page must go through the resolver
-    # and answer a refusal as a usage error (exit 2), not as an empty page.
-    producers = _exit2_producers(code)
-    exit2 = "|".join([r"NativeOffloadResult\(2"] + [re.escape(p) + r"\s*\(" for p in sorted(producers)])
-    for fn, _p, _r, fbody in _fn_bodies_with_sigs(code):
-        if not fbody or fn == name or "collectContactPage(" not in fbody:
-            continue
-        if not re.search(r"\b" + re.escape(name) + r"\s*\(", fbody):
+    # ── PG5: the legacy `-n` alias still refuses ──────────────────────────
+    legacy = [s for s in surfaces if s["legacy"]]
+    if legacy:
+        if not re.search(r'hasFlag\s*\(\s*"n"', body):
             findings.append(
-                ("CN4", f"collectContactPage caller `{fn}` skips the resolver",
-                 f"`{fn}` must resolve the page size through `{name}`"))
-            continue
-        if not re.search(r"return\s+(?:" + exit2 + r")", fbody):
+                ("PG5", "the surviving `-n` is not refused",
+                 "a `-n` that survived the alias rewrite carries no number — "
+                 "its token used to take the query slot"))
+        elif "legacyShortMax" not in body:
             findings.append(
-                ("CN4", f"collectContactPage caller `{fn}` cannot refuse",
-                 "a resolution the handler cannot honour must be answered as a "
-                 "usage error (exit 2), never as a default page size"))
+                ("PG5", "the `-n` refusal is not gated by the surface",
+                 "only a surface that rewrites `-n` may refuse it "
+                 "(`legacyShortMax`) — otherwise a `-n` typo becomes a page-"
+                 "size error on every other CLI"))
+        for surface in legacy:
+            hcode = codes.get(surface["file"], "")
+            if hcode and "bindLegacyShortMax(" not in hcode:
+                findings.append(
+                    ("PG5", f"`{surface['file']}` stopped binding `-n`",
+                     "the surface declares legacyShortMax, so its handler must "
+                     "still rewrite `-n N` to `--max N` before the parse"))
+
+    # ── PG1 / PG2 / PG4: every registered handler ────────────────────────
+    for handler_file, surface_names in sorted(owned.items()):
+        hcode = codes[handler_file]
+        raw_handler = sources[handler_file]
+        label = "/".join(surface_names)
+        call = PAGE_OUTCOME + ".resolve("
+        if call not in hcode:
+            findings.append(
+                ("PG1", f"`{handler_file}` does not resolve its page size ({label})",
+                 f"a registered surface must route through {call}…) — otherwise "
+                 "it keeps whatever it does today"))
+        for pattern, what in _PAGE_RAW_READS:
+            m = pattern.search(hcode)
+            if m:
+                findings.append(
+                    ("PG2", f"`{handler_file}` reads its page size raw: {what}"
+                            f"{_page_line(raw_handler, m.group(0))}",
+                     "the whitelist is the EMPTY SET: a registered handler may "
+                     "not read, default or clamp a page size itself"))
+        # PG4 — a refusal must become a usage error, never a default page.
+        producers = _exit2_producers(hcode)
+        exit2 = "|".join([r"NativeOffloadResult\(\s*2"]
+                         + [re.escape(p) + r"\s*\(" for p in sorted(producers)])
+        refusal_re = r"(?:" + exit2 + r"|throw\s+InvalidPageSize\s*\()"
+        covered = 0
+        faces = []
+        for fn, _p, _r, fn_body in _fn_bodies_with_sigs(hcode):
+            if not fn_body or call not in fn_body:
+                continue
+            covered += fn_body.count(call)
+            if re.search(refusal_re, fn_body):
+                continue
+            # A function that hands the outcome back is a 'face': its CALLERS
+            # must answer the refusal (this is the contacts delegation shape).
+            faces.append(fn)
+        if covered != hcode.count(call):
+            findings.append(
+                ("PG4", f"`{handler_file}` resolves a page size outside a function",
+                 "every resolve call must sit in a function whose refusal path "
+                 "is judgeable"))
+        for face in faces:
+            callers = [
+                (fn, fn_body) for fn, _p, _r, fn_body in _fn_bodies_with_sigs(hcode)
+                if fn_body and fn != face
+                and re.search(re.escape(face) + r"\s*\(", fn_body)
+            ]
+            if not callers:
+                findings.append(
+                    ("PG4", f"`{face}` answers a refusal with nothing in {handler_file}",
+                     "a resolver face that is never called cannot honour its "
+                     "contract anywhere"))
+            for fn, fn_body in callers:
+                if not re.search(refusal_re, fn_body):
+                    findings.append(
+                        ("PG4", f"`{fn}` ignores the page-size refusal from `{face}`",
+                         "a resolution the handler cannot honour must be a usage "
+                         "error (exit 2), never a default page size"))
     return findings
-
 
 # ── selftest: every rule must have a tooth, and the green arm must pass ──────
 
@@ -1644,55 +1847,103 @@ GREEN_CONTACTS = """
     }
 """
 
-# [dv28-A6 A-06] green fixture for the page-size contract (CN1-CN4). It states
-# the wanted shape: one resolver whose default is answered only when nothing was
-# spelled, two refusals (a collapsed `--max` and a surviving `-n`), a validated
-# range, and both page collectors turning a refusal into exit 2.
-GREEN_CONTACTS_PAGE = """
+# [dv29-A3 A-05] green fixtures for the SHARED page-size contract (PG0-PG5).
+# The resolver is quoted in the shape the tree ships it (raw read, bare-flag
+# refusal, surface-gated `-n`, one default answered last, a checked() helper
+# with both bounds), plus one minimal registered handler per surface. Every arm
+# below mutates exactly one of these files.
+GREEN_PAGE_RESOLVER = """
+internal sealed class PageSizeOutcome {
+    data class Ok(val value: Int) : PageSizeOutcome()
+    data class Invalid(val message: String) : PageSizeOutcome()
+    companion object {
+        fun resolve(args: OffloadArgs, surface: PageSizeSurface, default: Int = surface.default): PageSizeOutcome {
+            var winner: Ok? = null
+            for (name in surface.names) {
+                val raw = args.get(name) ?: continue
+                when (val parsed = checked(raw, surface, "--$name")) {
+                    is Invalid -> return parsed
+                    is Ok -> if (winner == null) winner = parsed
+                }
+            }
+            for (name in surface.names) {
+                if (args.hasFlag(name)) return Invalid("--$name expects ${surface.range}")
+            }
+            if (surface.legacyShortMax && args.hasFlag("n")) {
+                return Invalid("-n is not a page size")
+            }
+            return winner ?: Ok(default)
+        }
+        private fun checked(raw: String, surface: PageSizeSurface, spelled: String): PageSizeOutcome {
+            val value = raw.toIntOrNull()
+                ?: return Invalid("$spelled expects ${surface.range}, got '$raw'")
+            if (value < 1 || (surface.max != null && value > surface.max)) {
+                return Invalid("$spelled expects ${surface.range}, got $value")
+            }
+            return Ok(value)
+        }
+    }
+}
+internal object OffloadPageSize {
+    val CONTACTS = PageSizeSurface(
+        handlerFile = "ContactsOffloadHandler.kt",
+        names = listOf("max"),
+        default = 50,
+        max = 500,
+        legacyShortMax = true,
+    )
+    val CALENDAR = PageSizeSurface(
+        handlerFile = "CalendarOffloadHandler.kt",
+        names = listOf("limit", "max"),
+        default = 50,
+        max = null,
+    )
+    val SURFACES = listOf(CONTACTS, CALENDAR)
+}
+"""
+
+# The delegation shape: `resolvePageSize` hands the outcome back, both collectors
+# turn it into exit 2 (PG4 judges the CALLERS of that face).
+GREEN_PAGE_CONTACTS = """
     private fun doList(parsedArgs: OffloadArgs): NativeOffloadResult {
         val max = when (val size = resolvePageSize(parsedArgs)) {
             is PageSize.Ok -> size.value
             is PageSize.Invalid -> return pageSizeRefusal("list", size.message)
         }
-        val rows = collectContactPage(cursor, max)
-        return NativeOffloadResult(0, "[]\\n")
-    }
-    private fun doSearch(parsedArgs: OffloadArgs): NativeOffloadResult {
-        val max = when (val size = resolvePageSize(parsedArgs, 20)) {
-            is PageSize.Ok -> size.value
-            is PageSize.Invalid -> return pageSizeRefusal("search", size.message)
-        }
-        val rows = collectContactPage(cursor, max)
-        return NativeOffloadResult(0, "[]\\n")
+        return page(max)
     }
     companion object {
-        internal const val MAX_PAGE_SIZE = 500
-        private const val DEFAULT_LIST_MAX = 50
-        internal sealed class PageSize {
-            data class Ok(val value: Int) : PageSize()
-            data class Invalid(val message: String) : PageSize()
-        }
-        internal fun resolvePageSize(parsedArgs: OffloadArgs, default: Int = DEFAULT_LIST_MAX): PageSize {
-            parsedArgs.get("max")?.let { raw -> return pageSizeOf(raw, "--max") }
-            if (parsedArgs.hasFlag("max")) {
-                return PageSize.Invalid("--max expects an integer between 1 and $MAX_PAGE_SIZE")
+        internal fun bindLegacyShortMax(argv: List<String>): List<String> = argv
+        internal fun resolvePageSize(parsedArgs: OffloadArgs, default: Int = 50): PageSize =
+            when (val outcome = PageSizeOutcome.resolve(parsedArgs, OffloadPageSize.CONTACTS, default)) {
+                is PageSizeOutcome.Ok -> PageSize.Ok(outcome.value)
+                is PageSizeOutcome.Invalid -> PageSize.Invalid(outcome.message)
             }
-            if (parsedArgs.hasFlag("n")) {
-                return PageSize.Invalid("-n expects an integer between 1 and $MAX_PAGE_SIZE")
-            }
-            return PageSize.Ok(default)
-        }
-        private fun pageSizeOf(raw: String, spelled: String): PageSize {
-            val value = raw.toIntOrNull() ?: return PageSize.Invalid("$spelled: '$raw'")
-            if (value < 1 || value > MAX_PAGE_SIZE) {
-                return PageSize.Invalid("$spelled: $value")
-            }
-            return PageSize.Ok(value)
-        }
         private fun pageSizeRefusal(sub: String, message: String): NativeOffloadResult {
             return NativeOffloadResult(2, "android-contacts $sub: $message")
         }
     }
+"""
+
+# The direct shape: the collector answers the refusal itself.
+GREEN_PAGE_CALENDAR = """
+    private fun doList(args: OffloadArgs): NativeOffloadResult {
+        val limit = when (val size = PageSizeOutcome.resolve(args, OffloadPageSize.CALENDAR)) {
+            is PageSizeOutcome.Ok -> size.value
+            is PageSizeOutcome.Invalid ->
+                return NativeOffloadResult(2, "android-calendar list: ${size.message}")
+        }
+        return NativeOffloadResult(0, "$limit")
+    }
+"""
+
+GREEN_PAGE_SOURCES = {
+    "OffloadPageSize.kt": GREEN_PAGE_RESOLVER,
+    "ContactsOffloadHandler.kt": GREEN_PAGE_CONTACTS,
+    "CalendarOffloadHandler.kt": GREEN_PAGE_CALENDAR,
+}
+
+GREEN_CONFIG = """
 """
 
 GREEN_CONFIG = """
@@ -3733,60 +3984,117 @@ def selftest() -> int:
          GREEN_CONTACTS.replace("            return rewritten\n", "            return argv\n"),
          GREEN_NOTIFICATION_HANDLE, GREEN_FASTIO, {"V1g"}),
     ]
-    # [dv28-A6 A-06] the page-size contract teeth. Expected id sets are written
-    # by hand from the CN table (never derived from a run): one arm per way the
-    # three gaps can come back, plus the fail-closed arm for a lost resolver.
+    # [dv29-A3 A-05] the shared page-size contract teeth. Expected id sets are
+    # written by hand from the PG table (never derived from a run): one arm per
+    # way a refused page size can come back, plus the fail-closed derivations.
+    def _page_mut(*edits, drop=()):
+        out = {k: v for k, v in GREEN_PAGE_SOURCES.items() if k not in drop}
+        for name, old, new in edits:
+            assert old in out[name], f"page-size mutation missed {name}: {old[:40]}"
+            out[name] = out[name].replace(old, new, 1)
+        return out
+
     red_cases_page = [
-        ("page size: the value is read through a lossy getInt (gap 1)",
-         GREEN_CONTACTS_PAGE.replace(
-             'parsedArgs.get("max")?.let { raw -> return pageSizeOf(raw, "--max") }',
-             'parsedArgs.getInt("max")?.let { raw -> return pageSizeOf(raw.toString(), "--max") }'),
-         {"CN1"}),
+        ("page size: the raw value is parsed with toInt (non-numeric collapses)",
+         _page_mut(
+             ("OffloadPageSize.kt",
+              'val value = raw.toIntOrNull()\n'
+              '                ?: return Invalid("$spelled expects ${surface.range}, got \'$raw\'")',
+              'val value = raw.toInt()'),
+         ),
+         {"PG3"}),
         ("page size: a bare --max falls through to the default",
-         GREEN_CONTACTS_PAGE.replace(
-             'if (parsedArgs.hasFlag("max")) {\n'
-             '                return PageSize.Invalid("--max expects an integer between 1 and $MAX_PAGE_SIZE")\n'
-             '            }\n', ''),
-         {"CN1"}),
-        ("page size: a surviving -n is ignored (gap 2)",
-         GREEN_CONTACTS_PAGE.replace(
-             'if (parsedArgs.hasFlag("n")) {\n'
-             '                return PageSize.Invalid("-n expects an integer between 1 and $MAX_PAGE_SIZE")\n'
-             '            }\n', ''),
-         {"CN2"}),
-        ("page size: the positive lower bound is dropped (gap 3)",
-         GREEN_CONTACTS_PAGE.replace(
-             "if (value < 1 || value > MAX_PAGE_SIZE) {",
-             "if (value > MAX_PAGE_SIZE) {"),
-         {"CN3"}),
-        ("page size: a collector answers a refusal as a default page",
-         GREEN_CONTACTS_PAGE.replace(
-             'is PageSize.Invalid -> return pageSizeRefusal("list", size.message)',
-             'is PageSize.Invalid -> 50'),
-         {"CN4"}),
-        ("page size: the collector calls a resolver that is not the one defined",
-         GREEN_CONTACTS_PAGE.replace(
-             "internal fun resolvePageSize(parsedArgs: OffloadArgs, default: Int = DEFAULT_LIST_MAX)",
-             "internal fun unusedPageSize(parsedArgs: OffloadArgs, default: Int = DEFAULT_LIST_MAX)"),
-         {"CN4"}),
-        ("fail-closed: the resolver loses its shape (no default parameter)",
-         GREEN_CONTACTS_PAGE.replace(
-             "internal fun resolvePageSize(parsedArgs: OffloadArgs, default: Int = DEFAULT_LIST_MAX)",
-             "internal fun resolvePageSize(parsedArgs: OffloadArgs)").replace(
-             "return PageSize.Ok(default)", "return PageSize.Ok(DEFAULT_LIST_MAX)"),
-         {"CN0"}),
+         _page_mut(
+             ("OffloadPageSize.kt",
+              'if (args.hasFlag(name)) return Invalid("--$name expects ${surface.range}")\n',
+              ''),
+         ),
+         {"PG3"}),
+        ("page size: the positive lower bound is dropped",
+         _page_mut(("OffloadPageSize.kt", "value < 1 ||", "value < 0 ||")),
+         {"PG3"}),
+        ("page size: the declared upper bound is never compared",
+         _page_mut(("OffloadPageSize.kt", "(surface.max != null && value > surface.max)", "false")),
+         {"PG3"}),
+        ("page size: a second path answers the default",
+         _page_mut(
+             ("OffloadPageSize.kt",
+              "return winner ?: Ok(default)",
+              "if (winner == null) return Ok(default)\n            return Ok(default)"),
+         ),
+         {"PG3"}),
+        ("page size: a registered handler goes back to getInt ?: default",
+         _page_mut(
+             ("CalendarOffloadHandler.kt",
+              'val limit = when (val size = PageSizeOutcome.resolve(args, OffloadPageSize.CALENDAR)) {\n'
+              '            is PageSizeOutcome.Ok -> size.value\n'
+              '            is PageSizeOutcome.Invalid ->\n'
+              '                return NativeOffloadResult(2, "android-calendar list: ${size.message}")\n'
+              '        }',
+              'val limit = args.getInt("limit") ?: 50'),
+         ),
+         {"PG1", "PG2"}),
+        ("page size: a registered handler clamps the value it resolved",
+         _page_mut(
+             ("CalendarOffloadHandler.kt",
+              'return NativeOffloadResult(0, "$limit")',
+              'val capped = limit.coerceIn(1, 100)\n'
+              '        return NativeOffloadResult(0, "$capped")'),
+         ),
+         {"PG2"}),
+        ("page size: a collector ignores the refusal its face returns",
+         _page_mut(
+             ("ContactsOffloadHandler.kt",
+              'is PageSize.Invalid -> return pageSizeRefusal("list", size.message)',
+              'is PageSize.Invalid -> 50'),
+         ),
+         {"PG4"}),
+        ("page size: the surviving -n is refused on every surface, not just the alias one",
+         _page_mut(
+             ("OffloadPageSize.kt",
+              'if (surface.legacyShortMax && args.hasFlag("n")) {\n'
+              '                return Invalid("-n is not a page size")\n'
+              '            }',
+              'if (args.hasFlag("n")) {\n'
+              '                return Invalid("-n is not a page size")\n'
+              '            }'),
+         ),
+         {"PG5"}),
+        ("page size: the surviving -n is not refused at all",
+         _page_mut(
+             ("OffloadPageSize.kt",
+              'if (surface.legacyShortMax && args.hasFlag("n")) {\n'
+              '                return Invalid("-n is not a page size")\n'
+              '            }\n',
+              ''),
+         ),
+         {"PG5"}),
+        ("page size: a declared surface is missing from SURFACES",
+         _page_mut(("OffloadPageSize.kt", "val SURFACES = listOf(CONTACTS, CALENDAR)",
+                    "val SURFACES = listOf(CONTACTS)")),
+         {"PG0"}),
+        ("page size: a registered handler stops binding the legacy -n alias",
+         _page_mut(
+             ("ContactsOffloadHandler.kt",
+              "internal fun bindLegacyShortMax(argv: List<String>): List<String> = argv",
+              "internal fun bindShortMax(argv: List<String>): List<String> = argv"),
+         ),
+         {"PG5"}),
+        ("page size: a registered surface names a handler that is not there",
+         _page_mut(drop=("CalendarOffloadHandler.kt",)),
+         {"PG0"}),
     ]
-    for label, src, want in red_cases_page:
-        if src == GREEN_CONTACTS_PAGE:
+    for label, page_sources, want in red_cases_page:
+        if page_sources == GREEN_PAGE_SOURCES:
             print(f"SELFTEST-FAIL: {label}: mutation did not apply to any arm")
             failures += 1
             continue
-        got = {rid for rid, _, _ in check_contacts_page_size(src)}
+        got = {rid for rid, _, _ in check_offload_page_size(page_sources)}
         if got != want:
             print(f"SELFTEST-FAIL: {label}: got {sorted(got)}, want {sorted(want)}")
             failures += 1
-    # green control for the page-size contract
-    if _page_clean := check_contacts_page_size(GREEN_CONTACTS_PAGE):
+    # green control for the shared contract
+    if _page_clean := check_offload_page_size(GREEN_PAGE_SOURCES):
         print(f"SELFTEST-FAIL: page-size green fixture is not clean: {describe(_page_clean)}")
         failures += 1
 
@@ -4096,8 +4404,9 @@ def main(argv):
     findings += check_offload_cli_bindings(contacts_path.read_text(encoding="utf-8"),
                                           notification_path.read_text(encoding="utf-8"),
                                           fastio_path.read_text(encoding="utf-8"))
-    # [dv28-A6 A-06] the android-contacts page-size contract (CN1-CN4)
-    findings += check_contacts_page_size(contacts_path.read_text(encoding="utf-8"))
+    # [dv29-A3 A-05] the page-size contract runs over the whole offload dir —
+    # its scope is the registry inside OffloadPageSize.kt, so it needs every
+    # source (see check_offload_page_size below).
     findings += check_offload_json(*payload_files)
     findings += check_clipboard_clear((root / CLIPBOARD).read_text(encoding="utf-8"))
     findings += check_fastio_search(search_path.read_text(encoding="utf-8"))
@@ -4110,6 +4419,7 @@ def main(argv):
             return 1
         for _f in sorted(_p.glob("*.kt")):
             sources[_f.name] = _f.read_text(encoding="utf-8")
+    findings += check_offload_page_size(sources)
     findings += check_payload_delegates(sources, PAYLOAD_FILES)
     # [dv27-A5 A-07] the help / bare-invocation exit code, derived over the family
     findings += check_help_exit(sources)
@@ -4125,8 +4435,9 @@ def main(argv):
           "9/9 payload files hand formatBody JSON (N1 whole-file, N2 payload helpers), "
           "cross-file payload delegates registered (Z1 derived members, Z2 no String "
           "delegate in a payload file, Z3 exemptions still needed, Z4 derivation alive), "
-          "contacts page size validated (refuse non-numeric / <=0 / >bound, -n alias "
-          "survives only as a refusal, both collectors answer exit 2), "
+          "page size resolved by the ONE shared registry (refuse non-numeric / <=0 / "
+          ">bound / bare flag, -n alias survives only as a refusal, every registered "
+          "handler routes through it, its refusals reach the caller as exit 2), "
           "notification --after "
           "refuses an unreadable value, fastio subcommand scan knows its boolean flags "
           "and consumes -C, photos --album decision classified (non-numeric --id refuses), "

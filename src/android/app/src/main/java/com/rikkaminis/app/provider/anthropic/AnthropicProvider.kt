@@ -296,9 +296,14 @@ class AnthropicProvider(
         // retried instead of silently saved as complete.
         var contentChars = 0
         var sawClearFinish = false
-        // [B11] Accumulated tool-input chars, tracked separately from
-        // [contentChars] so a pure-tool turn cut mid input_json_delta still
-        // signals truncation.
+        // [B11] Accumulated tool-call activity, tracked separately from
+        // [contentChars] so a pure-tool turn (no text/thinking at all) still
+        // signals truncation. [dv29 A-01] Fed from ALL THREE protocol
+        // lifecycle points via AnthropicStreamSignals — the block
+        // announcement, the argument deltas and the block completion. Feeding
+        // it from the deltas alone left a cut between the announcement and the
+        // first non-empty delta looking like an empty stream, so the orphan
+        // flush below emitted a complete-with-{} call that the executor ran.
         var toolChars = 0
         // [FIX-1 / F-190] The Messages protocol splits usage across two events:
         // `message_start` carries the FULL accounting (input_tokens,
@@ -352,6 +357,14 @@ class AnthropicProvider(
                             toolInputBuffer.clear()
                             lastLoggedInputChars = -1 // [T-toolinput-sample-1012] reset sampling state
                             android.util.Log.d("ToolChain[Provider]", "→ ToolUseStart id=$currentToolId name=$currentToolName")
+                            // [dv29 A-01] The announcement is already tool-call
+                            // progress: a stream that dies before the first
+                            // argument delta must still be read as truncated,
+                            // otherwise a pure-tool turn (contentChars == 0)
+                            // looks like a fully empty stream here and the
+                            // orphan flush hands an argument-less call to the
+                            // executor.
+                            toolChars += toolUseStartActivityChars(currentToolId!!, currentToolName!!)
                             send(LLMStreamChunk.ToolUseStart(currentToolId!!, currentToolName!!))
                         }
                     }
@@ -380,7 +393,7 @@ class AnthropicProvider(
                                     // pure-tool turn that is cut mid input_json_delta must
                                     // still trip the truncated-Finished below instead of
                                     // looking like a clean, empty reply.
-                                    toolChars += partial.length
+                                    toolChars += toolInputDeltaActivityChars(partial)
                                     // [T-toolinput-sample-1012] Sampled like the OpenAI paths:
                                     // first delta + one per TOOL_LOG_INPUT_STEP_CHARS of growth
                                     // (per-fragment lines measured 74% of the worker's daily file).
@@ -403,6 +416,12 @@ class AnthropicProvider(
                             }
                             android.util.Log.d("ToolChain[Provider]", "→ ToolCallComplete id=$currentToolId name=$currentToolName args=${args.toString().take(300)}")
                             send(LLMStreamChunk.ToolCallComplete(currentToolId!!, currentToolName!!, args))
+                            // [dv29 A-01] Defence in depth for a completed tool
+                            // block that never streamed a delta (zero-argument
+                            // call): a stream cut between this block and the
+                            // terminal message_delta must still read as
+                            // truncated rather than as a clean no-finish EOF.
+                            toolChars += toolUseStopActivityChars(currentToolId!!, currentToolName!!)
                             currentToolId = null
                             currentToolName = null
                             toolInputBuffer.clear()
@@ -491,9 +510,10 @@ class AnthropicProvider(
             // before the terminal event). Without this, ChatViewModel would see no
             // Finished, treat it as a clean finish, and silently save a partial
             // answer. Signal truncated so the turnTruncated retry owns it. Gated on
-            // accumulated content (text/thinking [contentChars] or tool input
-            // [toolChars]) — a fully empty EOF is handled by
-            // failOnSilentEmptyCompletion and must not be flagged.
+            // accumulated content (text/thinking [contentChars] or tool-call
+            // activity [toolChars], the latter fed from the block announcement,
+            // the argument deltas AND the block completion) — a fully empty EOF is
+            // handled by failOnSilentEmptyCompletion and must not be flagged.
             if (!sawClearFinish && (contentChars > 0 || toolChars > 0)) {
                 send(LLMStreamChunk.Finished(null, truncated = true))
             }

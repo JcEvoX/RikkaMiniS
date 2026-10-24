@@ -1438,6 +1438,7 @@ def check_tree(root):
     # ── E1-E3: composer decisions read the live field value (dv19-B1) ──────
     problems.extend(composer_live_source_findings(inp_c))
     problems.extend(composer_clear_funnel_findings(inp_c))
+    problems.extend(composer_body_funnel_findings(inp_c))
 
     # ── G1-G4: ChatScreen routes composer intents, it does not resolve them ─
     # (dv23-B3) OPTIONAL read — the minimal fixture trees ship no ChatScreen.
@@ -1537,13 +1538,13 @@ fun ChatInputArea() {
         Text(filteredSlashCommands.size.toString())
         Popup(onDismissRequest = {
             cancelPendingImeBurst()
-            viewModel.setInputText(viewModel.dismissSlashMenu(inputFieldValue.text))
+            commitComposerBody(viewModel.dismissSlashMenu(inputFieldValue.text), null)
         })
         Row {
             if (!isThinking) {
                 it.clickable {
                     cancelPendingImeBurst()
-                    viewModel.setInputText(viewModel.executeSlashCommand(cmd, inputFieldValue.text))
+                    commitComposerBody(viewModel.executeSlashCommand(cmd, inputFieldValue.text), null)
                 }
             }
         }
@@ -1558,6 +1559,14 @@ fun ChatInputArea() {
         viewModel.setInputText("")
         inputFieldValue = TextFieldValue("")
         lastTrueCaretEnd = 0
+    }
+    // [deep-audit-1049 B-06] the body funnel: both copies, burst dropped first
+    val commitComposerBody: (String, Int?) -> Unit = { text, caret ->
+        cancelPendingImeBurst()
+        val at = (caret ?: lastTrueCaretEnd).coerceIn(0, text.length)
+        viewModel.setInputText(text)
+        inputFieldValue = TextFieldValue(text)
+        lastTrueCaretEnd = at
     }
     val performSendOrEnqueue: () -> Unit = handler@{
         val toSend = inputFieldValue.text
@@ -1913,6 +1922,101 @@ def _innermost_brace_span(text, idx):
             if d == 0:
                 return (start, j)
     return None
+
+
+BODY_FUNNEL_RE = re.compile(
+    r"\bval\s+(\w+)\s*:\s*\(\s*String\s*,\s*Int\??\s*\)\s*->\s*Unit\s*=\s*\{")
+SLASH_OUTLET_RE = re.compile(
+    r"\b(?:dismissSlashMenu|executeSlashCommand|showSlashMenuOverInput)\s*\(")
+CARET_WRITE_RE = re.compile(r"\bsetInputText\s*\([^)]*caretOverride")
+
+
+def composer_body_funnel_findings(inp_c):
+    """[deep-audit-1049 B-06] Every slash / `@` body rewrite goes through the
+    composer's own double-write funnel.
+
+    The composer keeps the same text in two places: `inputFieldValue` (the
+    BasicTextField's live value, written by onValueChange on every keystroke)
+    and `viewModel.inputText` (debounced — a >8-char IME burst is buffered for
+    150 ms). A slash / mention outlet that writes ONLY the ViewModel is therefore
+    lossy in a way that is invisible until it is not:
+
+      * inside the debounce window the field is AHEAD of the ViewModel, so
+        `setInputText(dismissSlashMenu(field.text))` can compute a string equal
+        to the ViewModel's current value — `MutableStateFlow` drops an equal
+        write, the inputText→field mirror never re-runs, and the field keeps the
+        slash prefix the user just dismissed;
+      * a caret passed as `caretOverride` on such a write is consumed by an
+        effect that may never run, leaving `_pendingCaret` to displace the
+        caret on the *next* unrelated input.
+
+    The funnel is the existing `commitComposerBody` (both copies + burst cancel);
+    this criterion derives the outlets from the resolution calls they must make
+    (`dismissSlashMenu` / `executeSlashCommand` / `showSlashMenuOverInput`) and
+    from any caret-tagged write, so a NEW outlet is covered without editing the
+    gate.
+    """
+    problems = []
+    funnels = []
+    for m in BODY_FUNNEL_RE.finditer(inp_c):
+        # The lambda body starts AT the matched `{`; `_innermost_brace_span` is
+        # exclusive of [idx] and would hand back the ENCLOSING block (the whole
+        # composable), which makes every check below vacuously true.
+        ob = m.end() - 1
+        if inp_c[ob] != "{":
+            ob = inp_c.find("{", m.end() - 1)
+        cb = _matching_brace_end(inp_c, ob) if ob >= 0 else -1
+        if cb > ob:
+            funnels.append((m.group(1), (ob, cb)))
+    if not funnels:
+        return [("B06", "no composer body funnel (`val commitComposerBody: (String, Int?) -> Unit "
+                         "= { … }`) — every slash/`@` rewrite would write one copy only "
+                         "(fail-closed)")]
+    name, (fob, fcb) = funnels[0]
+    body = inp_c[fob: fcb + 1]
+    for token, why in (
+        (BURST_DROP_RE, "drops the pending IME burst (a buffered snapshot would "
+                        "otherwise commit over the value it just wrote)"),
+        ("setInputText(", "writes the ViewModel copy"),
+        ("inputFieldValue =", "writes the field copy (the ViewModel write alone is "
+                              "suppressed when the text is unchanged)"),
+    ):
+        hit = bool(token.search(body)) if hasattr(token, "search") else (token in body)
+        if not hit:
+            problems.append(("B06", "the composer body funnel `%s` does not %s" % (name, why)))
+
+    def in_funnel(idx):
+        return fob <= idx <= fcb
+
+    outlets = 0
+    for m in SLASH_OUTLET_RE.finditer(inp_c):
+        if in_funnel(m.start()):
+            continue
+        outlets += 1
+        span = _innermost_brace_span(inp_c, m.start())
+        if span is None:
+            problems.append(("B06", "%s() is called outside any block — cannot prove the "
+                                    "rewrite goes through `%s`" % (m.group(0)[:-1],
+                                                                   name)))
+            continue
+        block = inp_c[span[0]: span[1] + 1]
+        if SET_INPUT_RE.search(block) and not re.search(r"\b%s\s*\(" % re.escape(name), block):
+            problems.append(("B06", "a slash outlet writes `setInputText` directly instead of "
+                                    "`%s` — an equal write is dropped by the StateFlow and the "
+                                    "field keeps the pre-command text" % name))
+        elif not re.search(r"\b%s\s*\(" % re.escape(name), block):
+            problems.append(("B06", "a slash outlet does not route its rewrite through `%s` "
+                                    "(the block never calls it)" % name))
+    for m in CARET_WRITE_RE.finditer(inp_c):
+        if in_funnel(m.start()):
+            continue
+        problems.append(("B06", "a caret-tagged `setInputText(…, caretOverride = …)` bypasses "
+                                "`%s` — the override rides an effect that may not run, and "
+                                "`_pendingCaret` then displaces the next caret" % name))
+    if outlets == 0:
+        problems.append(("B06", "no slash outlet found in the composer — the resolution calls "
+                                "moved, re-point this criterion (fail-closed)"))
+    return problems
 
 
 def composer_clear_funnel_findings(inp_c):
@@ -2321,11 +2425,11 @@ private fun ComposerIntentHost(viewModel: ChatViewModel) {
             when (command) {
                 ComposerCommand.ToggleSlashMenu -> {
                     cancelPendingImeBurst()
-                    viewModel.setInputText(viewModel.showSlashMenuOverInput(inputFieldValue.text))
+                    commitComposerBody(viewModel.showSlashMenuOverInput(inputFieldValue.text), null)
                 }
                 ComposerCommand.DismissSlashMenu -> {
                     cancelPendingImeBurst()
-                    viewModel.setInputText(viewModel.dismissSlashMenu(inputFieldValue.text))
+                    commitComposerBody(viewModel.dismissSlashMenu(inputFieldValue.text), null)
                 }
                 ComposerCommand.Clear -> clearComposerInput()
             }
@@ -3039,6 +3143,39 @@ def selftest():
         VM_REL: VM_F.replace(
             "    data object Clear : ComposerCommand\n", ""),
     }), ["G7"])
+
+    # ── B06 (deep-audit-1049): the composer body funnel ────────────────────
+    # The pre-fix shape: a slash outlet writes the ViewModel copy only.
+    expect_exact("B06 slash outlet writes setInputText directly", fixtures(**{
+        INPUT_REL: INPUT_F.replace(
+            "commitComposerBody(viewModel.dismissSlashMenu(inputFieldValue.text), null)",
+            "viewModel.setInputText(viewModel.dismissSlashMenu(inputFieldValue.text))"),
+    }), ["B06"])
+    # The double-truth is only fixed if BOTH copies are written.
+    expect_exact("B06 funnel drops the field write", fixtures(**{
+        INPUT_REL: INPUT_F.replace(
+            "        inputFieldValue = TextFieldValue(text)\n", ""),
+    }), ["B06"])
+    # …and only if the buffered burst cannot commit over the write.
+    expect_exact("B06 funnel keeps the pending burst", fixtures(**{
+        INPUT_REL: INPUT_F.replace(
+            "    val commitComposerBody: (String, Int?) -> Unit = { text, caret ->\n"
+            "        cancelPendingImeBurst()\n",
+            "    val commitComposerBody: (String, Int?) -> Unit = { text, caret ->\n"),
+    }), ["B06"])
+    # A caret-tagged write outside the funnel leaves _pendingCaret dangling.
+    expect_exact("B06 caret-tagged write bypasses the funnel", fixtures(**{
+        INPUT_REL: INPUT_F.replace(
+            "            commitComposerBody(viewModel.dismissSlashMenu(inputFieldValue.text), null)",
+            "            viewModel.setInputText(viewModel.dismissSlashMenu(inputFieldValue.text), "
+            "caretOverride = 3)"),
+    }), ["B06"])
+    # Fail-closed: no funnel declared at all.
+    expect_exact("B06 funnel declaration gone", fixtures(**{
+        INPUT_REL: INPUT_F.replace(
+            "    val commitComposerBody: (String, Int?) -> Unit = { text, caret ->",
+            "    val commitComposerBodyRemoved: (String, Int?) -> Unit = { text, caret ->"),
+    }), ["B06"])
 
     if failures:
         print("❌ selftest failed:")

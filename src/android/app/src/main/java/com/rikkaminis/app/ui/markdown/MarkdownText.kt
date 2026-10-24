@@ -790,7 +790,17 @@ private fun openMediaExternally(context: Context, file: File, mime: String) {
     val chooser = Intent.createChooser(intent, file.name).apply {
         addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
     }
-    try { context.startActivity(chooser) } catch (_: Throwable) { /* no handler */ }
+    try {
+        context.startActivity(chooser)
+    } catch (t: Throwable) {
+        // [deep-audit-1049 B-03] This exit used to be an empty catch: a device
+        // with no handler for the mime type looked exactly like a share that
+        // worked. Same family as the other share entries — keep the trace.
+        com.rikkaminis.app.logging.AppLogger.warning(
+            "MdMedia",
+            "openMediaExternally failed for ${file.name}: ${t.message}",
+        )
+    }
 }
 
 // -- Image block --
