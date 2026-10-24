@@ -90,7 +90,15 @@ class SkillRepository(private val context: Context) {
         // 3-tier priority below is unchanged. Upgrade path if skills > 40:
         // keyword prefilter -> embedding retrieval (see backlog §38-A).
         private const val MAX_SKILLS_IN_PROMPT = 40
-        private const val MAX_SKILL_DESC_LENGTH = 200
+        // [s39] 200 -> 400: 2 of 31 shipped skills were cut mid-sentence
+        // (tierflow-key-harvest 243 / rikkaminis-dev-methodology 206), and the
+        // cut tail is always the trigger clause — exactly the part the agent
+        // needs to decide whether to read the skill at all. Truncation happens
+        // at render time in [skillPromptFragment], never on the stored row, so
+        // no migration is involved. 400 covers the longest shipped description
+        // with headroom; revisit (sentence-boundary cut) only if a real
+        // description exceeds it.
+        private const val MAX_SKILL_DESC_LENGTH = 400
         /** [dv22-B4] Ids per batched `IN (…)` SELECT in
          *  [sessionEnablementMap]. SQLITE_MAX_VARIABLE_NUMBER is 999 on older
          *  SQLite builds; 400 leaves rom for the session id and keeps the
