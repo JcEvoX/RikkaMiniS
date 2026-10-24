@@ -63,7 +63,14 @@
 - **L1 本门真树**：三门 `python3 scripts/scan/<g>.py .` 全 rc=0（share「arm1..arm6 green」+ 统计行、print PASS ×2、chat_ui GATE OK）；三门 `--selftest` 全 PASS（SHARE_DIR_PRUNE / FILEPREVIEW_PRINT_BOUNDED / CHAT_UI_INTERACTION (72 fixtures)）；`scan.sh`/`test_scan.py` diff 0。
 - **L2 邻门子集**：`gate_run.sh --subset` 因全局锁排队被取消（另一会话的全量 111 门 + test_scan 在跑，A4 会话随后又开全量）——**未跑成，缺口交给分支 CI**（CI 跑 scan.sh 全量 + test_scan 全量）。已跑成的邻门证据：`filepreview_print_bounded` 的 LogManagementScreen 判定 PASS（读边相邻）。
 - **L3 沙箱 JVM 装置（`probe/l3/`）**：`extract.py` 从生产文件**按声明切片**两个纯函数（`shouldReleasePrintSlot`/`isCurrentPrintView`/`composerCommitCaret`）+ 真 `kotlinc`（/opt/kotlinc，2.x）编译切片 + `ComposerTextOps.kt` + **真实测试类两份** → `JUnitCore` **OK (21 tests)**（print 6 + composer 15，其中 11 条既有断言零改动）。变异 4 臂各红且**只红预期用例**：m1 谓词反转 3 红（真值表计数用例抓住）/ m2 恒等→相等 1 红（等值 peer 用例）/ m3 去 clamp 1 红 / m4 null 兜底改 0 1 红。**身份测试的自伤**：首版用 `StringBuilder`（不覆写 equals，`==` 也是引用比较）⇒ m2 不红——换 `mutableListOf`（等值不恒等）后 m2 红恰好 1。
-- **L4 分支 CI**：run **#2605**（workflow build-apk.yml，dispatch @ `a183d691`）——结果见回报（待绿后回填）。
+- **L4 分支 CI**：run **#2605**（id `40070943088`，workflow build-apk.yml，dispatch @ `a183d691`，job `120804033167`）**success**，attempt 1，日志 1,463,186 B。判读（`probe/ci/judge.py`，API 取 head_sha/steps + 日志两跳下载）：
+  - 26 步 `not_ok=[]`，唯一 `skipped = Publish to Releases`（main 门控，日志里不出现该行——只能从 steps API 取）；
+  - 门头 `[1/111] … [111/111]` 连续且唯一（111 门，本批 0 新建）；
+  - `Summary: 111 passed, 0 failed` 恰一条，其余 6 条步骤级 Summary（5/10/13/22/25/33 + 10）**全部 0 failed**；
+  - `ALL 342 CASES PASS` 1 条（test_scan 夹具数不变）；
+  - 编译错 0、本支文件警告 0、游离 FAILED 0；
+  - 新用例逐条 PASSED：`FilePreviewPrintLifecycleTest` 6/6、`ComposerCommandHandoffTest` 15/15（含新增 4，既有 11 条语义未改）。
+  - 源码树等价：`git diff --name-only a183d691 HEAD` = `fix-reports/dv29-FIX-B3.md` 一个文件（`.md` 不参与构建、不在 workflow paths 内）。
 - **PRE 臂（JVM 侧不可行，门侧已做）**：新纯函数修前不存在 ⇒ 编译期红无意义；判据级 PRE = 基线树跑新门（见 §4）。
 
 ## 6. 残留与失真
@@ -76,7 +83,7 @@
 
 ## 7. 身份链
 
-基线 main `b82aa8dc` → 3 提交：`c5f211bc`（生产 8 文件）/ `ed2405d0`（测试 2 文件）/ `a183d691`（门 3 文件）→ push `origin/fix/dv29-b3-share-print-composer` → dispatch CI run **#2605**（2026-10-24T06:37:36Z）。`git diff --name-only` 三段各自独立（生产/测试/门不混）；worktree `probe/` 已 gitignore（`:141`），未入库。
+基线 main `b82aa8dc` → 4 提交：`c5f211bc`（生产 8 文件）/ `ed2405d0`（测试 2 文件）/ `a183d691`（门 3 文件）**← CI 绿于此** / `419ff840` + 本次回填（报告 `.md`）→ push `origin/fix/dv29-b3-share-print-composer` → CI run **#2605**（2026-10-24T06:37:36Z）success。三方 sha：本地 `a183d691` == `ls-remote` == `run.head_sha` = `a183d691a1c026cf40ef2aa27f6ce312979ed00f`。**停在分支，未合并 main。**`git diff --name-only` 三段各自独立（生产/测试/门不混）；worktree `probe/` 已 gitignore（`:141`），未入库。
 
 ## 8. 自证成本与不确定项
 
