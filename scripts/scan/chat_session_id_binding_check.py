@@ -540,6 +540,63 @@ def _matched_paren(code: str, open_idx: int) -> "str | None":
     return None
 
 
+def _stmt_text(code: str, start: int) -> str:
+    """Statement text beginning at [start], cut at a depth-0 `;` / newline / `}`.
+
+    Kotlin rarely uses semicolons, so the depth-0 newline is load-bearing: the
+    alternative (`[^\\n]*`) would also truncate a chain that legitimately wraps
+    onto the next line, and a bracket-blind scan would run into the next
+    statement and judge a value that is not the bound one.
+    """
+    depth = 0
+    i, n = start, len(code)
+    while i < n:
+        c = code[i]
+        if c == '"' or c == "'":
+            i = _skip_string_literal(code, i)
+            continue
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            if depth == 0:
+                break
+            depth -= 1
+        elif depth == 0 and c in ";\n":
+            break
+        i += 1
+    return code[start:i]
+
+
+def _named_arg_value(args_text: str, name: str) -> "str | None":
+    """Value of the `name = …` argument inside a `( … )` slice, or None.
+
+    Bracket-aware so a scope function / nested call in the value does not
+    truncate it — the whole point is to read the VALUE, not to see the name.
+    """
+    if not args_text:
+        return None
+    m = re.search(r"\b" + re.escape(name) + r"\s*=(?!=)\s*", args_text)
+    if m is None:
+        return None
+    depth = 0
+    i, n = m.end(), len(args_text)
+    while i < n:
+        c = args_text[i]
+        if c == '"' or c == "'":
+            i = _skip_string_literal(args_text, i)
+            continue
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            if depth == 0:
+                break
+            depth -= 1
+        elif c == "," and depth == 0:
+            break
+        i += 1
+    return args_text[m.end():i].strip()
+
+
 def _reaches(code: str, block: str, token: str, depth: int = 2, seen=None) -> bool:
     """Is [token] reachable from [block] through at most [depth] same-file hops?
 
@@ -563,6 +620,89 @@ def _reaches(code: str, block: str, token: str, depth: int = 2, seen=None) -> bo
         if body is not None and _reaches(code, body, token, depth - 1, seen):
             return True
     return False
+
+
+# wide-1024 (dataflow): criterion 13's store fallback. The argument that has to
+# be the row read is the VALUE bound to `owner`, and nothing may filter it into
+# a constant: `ownerFor(...).getOrNull()?.takeIf { false }` reads the store,
+# throws the answer away, and reports "nothing to cancel" for every session.
+RE_OWNER_BIND = re.compile(r"\bval\s+owner\s*=\s*")
+RE_CONST_FALSE_FILTER = re.compile(
+    r"\btake(?:If|Unless)\s*\{\s*(?:false|!\s*true|0\s*==\s*1)\s*\}"
+)
+
+
+def _owner_binding_violations(body: str) -> "list[str]":
+    m = RE_OWNER_BIND.search(body)
+    if m is None:
+        return [
+            "HeadlessChatRunner.kt: `viewModelForCancel` no longer binds "
+            "`val owner = …` from the store — the UI-created ViewModel has no owner "
+            "to build on (re-anchor this criterion, do not drop it)"
+        ]
+    errs = []
+    stmt = _stmt_text(body, m.end())
+    if "ownerFor(" not in stmt:
+        errs.append(
+            "HeadlessChatRunner.kt: the `owner` binding does not come from "
+            "`ChatViewModelStore.ownerFor(…)` (`%s`) — the store lookup has to BE the "
+            "value, not a mention inside it" % stmt.strip()
+        )
+    if RE_CONST_FALSE_FILTER.search(stmt):
+        errs.append(
+            "HeadlessChatRunner.kt: the store fallback is filtered by a constant-false "
+            "predicate (`%s`) — owner is null for every session, so a UI-created "
+            "ViewModel can never be cancelled and every `cancel` reports false"
+            % stmt.strip()
+        )
+    if not re.search(r"ViewModelProvider\s*\(\s*owner\b", body):
+        errs.append(
+            "HeadlessChatRunner.kt: the fallback owner never reaches "
+            "`ViewModelProvider(owner, …)` — the resolved value is computed and then "
+            "discarded, so the fallback builds nothing"
+        )
+    return errs
+
+
+RE_ACTIVE_SESSION_BIND = re.compile(r"\b(?:val|var)\s+activeSessionId\s*=\s*")
+RE_LIVE_ID_SOURCE = re.compile(
+    r"ChatViewModelStore\s*\.\s*resolveSessionId\s*\("
+    r"|ChatViewModelStore\s*\.\s*activeSessionId"
+    r"|viewModel\s*\.\s*currentSessionId"
+)
+
+
+def _active_session_binding_violations(effect_body: str) -> "list[str]":
+    """wide-1024 (dataflow): `activeSessionId` must BE the live id.
+
+    The old criterion asked whether the effect body MENTIONS
+    `viewModel.currentSessionId` / `resolveSessionId(` somewhere and compares
+    `pending.sessionId != activeSessionId` — so binding the route arg and
+    tucking a resolver call into a nested lambda satisfied both. What the
+    comparison needs is the value.
+    """
+    m = RE_ACTIVE_SESSION_BIND.search(effect_body)
+    if m is None:
+        return [
+            "ChatScreen.kt: pinned-shortcut must bind `val activeSessionId = …` from the "
+            "live session id (binding not found — re-anchor this criterion, do not drop it)"
+        ]
+    rhs = _stmt_text(effect_body, m.end())
+    norm = re.sub(r"\s+", "", rhs)
+    if re.match(r"sessionId(?![A-Za-z0-9_])", norm):
+        return [
+            "ChatScreen.kt: `activeSessionId` is bound to the bare route arg `sessionId` "
+            "(`%s`) — a resolver mentioned inside the expression does not produce the "
+            "value, so the stale `__new__<uuid>` key wins and the just-generated HTML "
+            "preview is dropped by `pending.sessionId != activeSessionId`" % rhs.strip()
+        ]
+    if not RE_LIVE_ID_SOURCE.search(rhs):
+        return [
+            "ChatScreen.kt: `activeSessionId` must be derived from the live id "
+            "(`ChatViewModelStore.resolveSessionId(viewModel.currentSessionId)`) — got `%s`"
+            % rhs.strip()
+        ]
+    return []
 
 
 def _apply_override_violations(code: str) -> "list[str]":
@@ -591,12 +731,33 @@ def _apply_override_violations(code: str) -> "list[str]":
     else:
         at = body.find(APPLY_OVERRIDE_DECISION_TOKEN)
         args = _matched_paren(body, at + len(APPLY_OVERRIDE_DECISION_TOKEN) - 1)
-        if args is None or APPLY_OVERRIDE_ROW_TOKEN not in args:
+        row_val = _named_arg_value(args or "", "existingBinding")
+        if args is None or (row_val is None and APPLY_OVERRIDE_ROW_TOKEN not in args):
             errs.append(
                 "HeadlessChatRunner.kt: the row value is not what the decision is fed "
                 "— reading `modelBinding` and passing null/false is the same defect "
                 "with extra steps (args: %s)" % (args or "<unbalanced>")
             )
+        elif row_val is not None:
+            # wide-1024 (dataflow): the argument NAME being present is not the
+            # contract — the value the name is bound to is. `existingBinding =
+            # null.also { …getSession(…)?.modelBinding }` reads the row, throws
+            # it away, and hands the decision a literal null.
+            norm = re.sub(r"\s+", "", row_val)
+            if re.match(r"(?:null|false|0)(?![A-Za-z0-9_])", norm):
+                errs.append(
+                    "HeadlessChatRunner.kt: the row value is not what the decision is "
+                    "fed — `existingBinding` is bound to `%s`, so the row read sits "
+                    "inside the expression instead of being its value: every pinned "
+                    "session then reads as unbound and is rebound to the new-session "
+                    "default" % row_val
+                )
+            elif APPLY_OVERRIDE_ROW_TOKEN not in row_val:
+                errs.append(
+                    "HeadlessChatRunner.kt: `existingBinding` is not the row read "
+                    "(got `%s`) — the decision has to be fed the persisted binding"
+                    % row_val
+                )
     if APPLY_OVERRIDE_DEFAULT_TOKEN not in body:
         errs.append(
             "HeadlessChatRunner.kt: applyModelOverride dropped the default primary "
@@ -827,6 +988,37 @@ def _offmain_bounded_blocks(prefix: str) -> "list[tuple[int, int]]":
     return blocks
 
 
+RE_FIRST_LAMBDA = re.compile(r"\.\s*first\s*\{")
+
+
+def _wait_predicate_violation(prefix: str, k: int) -> "str | None":
+    """wide-1024 (dataflow): the latch wait's predicate must READ the latch.
+
+    `vm.sessionLoaded.first { true }` is a wait in name only — the initial
+    `false` satisfies the predicate, so the call returns at once and the
+    mutation races the load. Judged on the lambda background's use of its
+    parameter (implicit `it` or a named one), not on the `.first {` prefix.
+    """
+    m = RE_FIRST_LAMBDA.search(prefix, k)
+    if m is None:
+        return None
+    brace = prefix.find("{", m.start())
+    if brace < 0:
+        return None
+    end = _match_brace(prefix, brace)
+    if end is None:
+        return ("lambda could not be parsed (fail-closed) — re-point this criterion")
+    body = prefix[brace + 1:end]
+    named = re.search(r"\(?\s*([A-Za-z_]\w*)\s*(?::\s*[A-Za-z_]\w*\s*)?\)?\s*->", body)
+    param = named.group(1) if named else "it"
+    rest = body[named.end():] if named else body
+    if not re.search(r"\b" + re.escape(param) + r"\b", rest):
+        return ("uses a predicate that ignores the value it waits for (`{ %s }`) — the "
+                "initial `false` satisfies it, so the wait returns immediately and the "
+                "mutation races the load" % body.strip())
+    return None
+
+
 def _session_barrier_violations(rel: str, code: str) -> "list[str]":
     out: "list[str]" = []
     spans = _member_spans(code)
@@ -892,6 +1084,9 @@ def _session_barrier_violations(rel: str, code: str) -> "list[str]":
                 "without a timeout pins the RPC connection forever when the load "
                 "never completes" % (rel, name)
             )
+        pred = _wait_predicate_violation(prefix, k)
+        if pred:
+            out.append("%s: the `sessionLoaded` wait in `%s` %s" % (rel, name, pred))
     return out
 
 
@@ -1531,6 +1726,7 @@ def check(root: Path) -> int:
                 "ChatScreen.kt: pinned-shortcut must accept the live session id "
                 "(`pending.sessionId != activeSessionId`), not the route arg alone"
             )
+        errors.extend(_active_session_binding_violations(effect_body))
 
     # --- 9. [da1029-A] MainActivity's New-Chat entries resolve the draft id
     #     through the single source (ComposerDraftStore.nextDraftId) ---
@@ -1765,6 +1961,7 @@ def check(root: Path) -> int:
                     "path — RPC-driven sessions would rebuild their ViewModel on every "
                     "cancel"
                 )
+            errors.extend(_owner_binding_violations(resolver_body))
 
         # --- 15. [deep-audit-1044 A-03] a dropped send is an ERROR, never the
         #     previous turn replayed as a "Completed". ---
@@ -3150,6 +3347,56 @@ def selftest() -> int:
         failures.append("criterion 19 missing anchor: gate stayed GREEN (fail-closed violated)")
     else:
         print(f"selftest: criterion 19 missing anchor -> RED ({len(errs)} violation(s)) OK")
+
+    # ── wide-1024 witnesses: the four shapes that defeated this gate ────────
+    # Each is the find→replace from the wide-sweep report, replayed verbatim
+    # onto the green fixture; the arm names its own anchor so a red that comes
+    # from a different criterion cannot masquerade as proof.
+    C8_WITNESS = screen.replace(
+        "    val activeSessionId = ChatViewModelStore.resolveSessionId(viewModel.currentSessionId)\n",
+        "    val activeSessionId = sessionId.also { "
+        "ChatViewModelStore.resolveSessionId(viewModel.currentSessionId) }\n",
+    )
+    C13_WITNESS = FIXTURE_RUNNER.replace(
+        "val owner = runCatching { ChatViewModelStore.ownerFor(sessionId) }"
+        ".getOrNull() ?: return null\n",
+        "val owner = runCatching { ChatViewModelStore.ownerFor(sessionId) }"
+        ".getOrNull()?.takeIf { false } ?: return null\n",
+    )
+    C16_WITNESS = FIXTURE_RUNNER.replace(
+        "existingBinding = app.chatRepository.dao.getSession(sessionId)?.modelBinding,",
+        "existingBinding = null.also { app.chatRepository.dao"
+        ".getSession(sessionId)?.modelBinding },",
+    )
+    C14_WITNESS = FIXTURE_RUNNER_BARRIER.replace(
+        "{ vm.sessionLoaded.first { it } }", "{ vm.sessionLoaded.first { true } }", 1)
+
+    for name, expect, tree, unchanged in (
+        ("wide C8 activeSessionId bound to the route arg (dataflow)",
+         "bare route arg",
+         (C8_WITNESS, nav, move, FIXTURE_STORE, None, None, None, None),
+         C8_WITNESS == screen),
+        ("wide C13 store fallback filtered to null (dataflow)",
+         "constant-false",
+         (screen, nav, move, FIXTURE_STORE, FIXTURE_ACTIVITY, C13_WITNESS, None, None),
+         C13_WITNESS == FIXTURE_RUNNER),
+        ("wide C16 existingBinding fed null.also{row} (dataflow)",
+         "not what the decision is fed",
+         (screen, nav, move, FIXTURE_STORE, FIXTURE_ACTIVITY, C16_WITNESS, None, None),
+         C16_WITNESS == FIXTURE_RUNNER),
+        ("wide C14 latch wait predicate ignores the value (dataflow)",
+         "ignores the value it waits for",
+         (screen, nav, move, FIXTURE_STORE, FIXTURE_ACTIVITY, C14_WITNESS, None, None),
+         C14_WITNESS == FIXTURE_RUNNER_BARRIER),
+    ):
+        if unchanged:
+            failures.append(f"{name}: mutation is a no-op (anchor not found)")
+            continue
+        rc, errs = run_tree(*tree)
+        if rc == 0 or not [e for e in errs if expect in e]:
+            failures.append(f"{name}: expected a `{expect}` violation, got {errs}")
+        else:
+            print(f"selftest: {name} -> RED ({len(errs)} violation(s)) OK")
 
     if failures:
         print("\nselftest FAILURES:")

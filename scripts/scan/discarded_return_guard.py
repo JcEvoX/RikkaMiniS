@@ -273,6 +273,43 @@ def extract_block(lines, sig_re):
         return i, len(lines) - 1
     return -1, -1
 
+def _brace_block(text, open_idx):
+    """Text of the `{...}` block whose '{' is at [open_idx] (None if unterminated)."""
+    depth = 0
+    for i in range(open_idx, len(text)):
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[open_idx:i + 1]
+    return None
+
+
+def _arrow_arms(block):
+    """[(header, body)] of a `when { … }` block, split at top-level `->`.
+
+    A `when` arm's decision is the text on its LEFT of the arrow and its value
+    is everything up to the next arrow, so nesting and multi-line bodies are
+    preserved without a Kotlin parser."""
+    depth = 0
+    arrows = []
+    for i, ch in enumerate(block):
+        if ch in "{([":
+            depth += 1
+        elif ch in "})]":
+            depth -= 1
+        elif ch == "-" and i + 1 < len(block) and block[i + 1] == ">" and depth <= 1:
+            arrows.append(i)
+    out = []
+    for idx, a in enumerate(arrows):
+        prev_end = arrows[idx - 1] + 2 if idx else 1
+        header = block[prev_end:a].strip()
+        body_end = arrows[idx + 1] if idx + 1 < len(arrows) else len(block) - 1
+        out.append((header, block[a + 2:body_end]))
+    return out
+
+
 def scan_queue_drain(root):
     findings = []
     path = os.path.join(root, QI_FILE)
@@ -331,6 +368,22 @@ def scan_queue_drain(root):
                 "ChatQueueInterruption.kt:%d  [B-04 D2] %s persists BEFORE the "
                 "combinedParts.isEmpty() guard — the guard must precede the persist" % (i0 + 1, label)
             )
+        else:
+            # [wide-1024 dataflow] The guard must TERMINATE: `if (empty) { log }`
+            # keeps the guard, the order and the clean-up shape while the empty
+            # user row falls through to appendMessage (a deterministic 400).
+            after = fbody[guard.end():]
+            stripped = after.lstrip()
+            if stripped.startswith("{"):
+                body = _brace_block(after, after.index("{"))
+            else:
+                body = after.split("\n", 1)[0]
+            if body is None or not re.search(r"\b(return|throw)\b", body):
+                findings.append(
+                    "ChatQueueInterruption.kt:%d  [B-04 D2] %s's combinedParts.isEmpty() guard "
+                    "does not TERMINATE — control falls through to appendMessage, so an empty "
+                    "user row is persisted and every provider answers 400" % (i0 + 1, label)
+                )
 
     # D3: placeholders removed + exactly one merged bubble with the persisted id
     if drain is None:
@@ -395,6 +448,145 @@ def scan_queue_drain(root):
 
 SHARE_FILE = "share/ShareReceiverActivity.kt"
 LEDGER_FILE = "share/StagedBytesLedger.kt"
+
+def _when_subject_block(text, when_at):
+    """The `{…}` body of the `when (...)` that starts at [when_at]."""
+    i = text.find("(", when_at)
+    if i < 0:
+        return None
+    depth = 0
+    for k in range(i, len(text)):
+        if text[k] == "(":
+            depth += 1
+        elif text[k] == ")":
+            depth -= 1
+            if depth == 0:
+                j = k + 1
+                while j < len(text) and text[j] in " \t\n":
+                    j += 1
+                if j < len(text) and text[j] == "{":
+                    return _brace_block(text, j)
+                return None
+    return None
+
+
+def _last_value_expr(body):
+    """The value the arm hands back (last non-brace, non-log line)."""
+    for raw in reversed(body.split("\n")):
+        t = raw.strip().rstrip(",;")
+        if not t or t in ("}", ")", "{", "else"):
+            continue
+        if re.search(r"AppLogger\.|Log\.|MemorySpikeRecorder\.", t):
+            continue
+        return t
+    return ""
+
+
+def _copy_outcome_gaps(text):
+    """[wide-1024 dataflow] The copy OUTCOME must decide the return value.
+
+    G3 already holds that `val outcome = copySharedStream(…)` exists. The
+    witnessed shape keeps that binding, keeps the `is SharedStreamCopy.Failed`
+    label, keeps the log line — and returns the staged FILENAME from the
+    failure arm (`null` → `name`), which is the ghost attachment in one token:
+    the caller builds a PendingShare.Item for a file that was never created."""
+    gaps = []
+    m = re.search(r"val\s+(\w+)\s*=\s*copySharedStream\s*\(", text)
+    if m is None:
+        # No binding at all is G3's own criterion (and the A08-7 selftest arm):
+        # a second finding here would double-count that shape.
+        return []
+    when_at = None
+    for cand in re.finditer(r"\bwhen\b", text):
+        if cand.start() < m.start() and m.start() - cand.start() < 400:
+            when_at = cand.start()
+    block = _when_subject_block(text, when_at) if when_at is not None else None
+    if block is None:
+        return ["the copySharedStream outcome is bound but never branched on "
+                "(fail-closed) — nothing distinguishes 'staged' from 'staged nothing'"]
+    arms = _arrow_arms(block)
+    failed = [(h, b) for h, b in arms if re.search(r"\bFailed\b", h)]
+    if not failed:
+        return ["the copy outcome `when` no longer has a Failed arm (fail-closed)"]
+    staged_vals = {
+        _last_value_expr(b) for h, b in arms if re.search(r"\bStaged\b", h)
+    }
+    for _h, body in failed:
+        if not re.search(r"\bnull\b|\breturn\b|\bthrow\b", body):
+            val = _last_value_expr(body) or body.strip()[:30]
+            hint = " (the same value the Staged arm returns)" if val in staged_vals else ""
+            gaps.append(
+                "the copy Failed arm yields `%s` instead of failing%s — the caller "
+                "receives a filename for a file the copy never created (ghost "
+                "attachment)" % (val, hint)
+            )
+    return gaps
+
+
+def _admission_gate_gaps(branch):
+    """[wide-1024 dataflow] Is the admission DECISION consumed?
+
+    The pre-fix shape the ledger criteria pin is "write with no budget guard".
+    The witnessed shape is subtler: the guard is still CALLED and its result is
+    still BOUND (`val admission = admitAttachText(…)`), but nothing reads it —
+    the write/credit lines were lifted out of the `when` and the branch guard
+    deleted, so an over-cap share is written and charged to disk anyway. Every
+    substring and ordering criterion stays satisfied.
+
+    Returns a list of findings (empty = the decision is respected)."""
+    gaps = []
+    adm = re.search(r"val\s+(\w+)\s*=\s*admitAttachText\s*\(", branch)
+    if adm is None:
+        return gaps                      # the "no guard at all" arm owns this
+    var = adm.group(1)
+    uses = re.findall(r"\b" + re.escape(var) + r"\b", branch)
+    if len(uses) < 2:
+        return [
+            "the AttachText budget decision is BOUND and never consumed "
+            "(`val %s = admitAttachText(…)` then nothing reads it) — an over-cap "
+            "share is written and charged to the staging budget anyway" % var
+        ]
+    gate = re.search(r"when\s*\(\s*" + re.escape(var) + r"\s*\)\s*\{", branch)
+    if gate is not None:
+        block = _brace_block(branch, gate.end() - 1)
+        if block is None:
+            return ["the AttachText admission `when` block is unterminated (fail-closed)"]
+        arms = _arrow_arms(block)
+        if not arms:
+            return ["the AttachText admission `when` has no readable arms (fail-closed)"]
+        writes = [s for h, s in arms if re.search(r"writeText\s*\(|stagedBytes\.credit", s)]
+        admits = [s for h, s in arms if "Admitted" in h]
+        if not admits:
+            return ["the AttachText admission `when` no longer has an Admitted arm "
+                    "(fail-closed) — cannot tell which branch is allowed to write"]
+        if not re.search(r"writeText\s*\(|stagedBytes\.credit", admits[0]):
+            return ["the AttachText write/credit sits OUTSIDE the Admitted arm — the "
+                    "budget decision is made and then bypassed"]
+        for h, s in arms:
+            if "Admitted" in h:
+                continue
+            if re.search(r"writeText\s*\(|stagedBytes\.credit", s):
+                return ["the AttachText %s arm writes/credits anyway — a rejected share "
+                        "still lands on disk and against the cap" % h.strip()[:40]]
+        del writes
+        return gaps
+    cond = re.search(
+        r"if\s*\(([^\n]*" + re.escape(var) + r"[^\n]*)\)\s*\{", branch)
+    if cond is not None:
+        block = _brace_block(branch, cond.end() - 1) or ""
+        if "Admitted" in cond.group(1):
+            if not re.search(r"writeText\s*\(|stagedBytes\.credit", block):
+                return ["the AttachText write is not inside the `%s` branch"
+                        % cond.group(1).strip()[:60]]
+        elif re.search(r"writeText\s*\(|stagedBytes\.credit", block):
+            return ["the AttachText write sits inside a branch that is NOT the Admitted "
+                    "arm (`%s`)" % cond.group(1).strip()[:60]]
+        return gaps
+    return [
+        "the AttachText budget decision `%s` is never used as a branch condition — "
+        "the guards exist and the write ignores them" % var
+    ]
+
 
 def scan_staged_bytes(root):
     findings = []
@@ -471,6 +663,8 @@ def scan_staged_bytes(root):
                         end = j
                         break
             branch = sbody[brace:end + 1]
+            for gap in _admission_gate_gaps(branch):
+                findings.append("%s:%d  [A-07 S2] %s" % (SHARE_FILE, i0 + 1, gap))
             write = re.search(r"writeText\s*\(", branch)
             admit = re.search(r"admitAttachText\s*\(", branch)
             credit = re.search(r"stagedBytes\.credit\s*\(", branch)
@@ -779,6 +973,8 @@ def scan_share_stream_guard(root):
                 "written, and the caller is back to handing out a filename for a file "
                 "that may not exist" % SHARE_FILE
             )
+        for gap in _copy_outcome_gaps(package_code):
+            findings.append("%s:?  [A-08 G3] %s" % (SHARE_FILE, gap))
 
     # G1 — guard before the destination file is created.
     #
@@ -1020,6 +1216,20 @@ def drain_self_test():
         got,
     ))
 
+    # [wide-1024 dataflow] D2b: the guard survives, its TERMINATION does not —
+    # the empty user row falls through to appendMessage (a deterministic 400)
+    # while presence + order criteria stay satisfied.
+    n3b = {rel: DRAIN_CLEAN.replace(
+        "    if (combinedParts.isEmpty()) {\n        return null\n    }\n",
+        "    if (combinedParts.isEmpty()) {\n        log(\"empty\")\n    }\n", 1,
+    )}
+    got = run(n3b)
+    results.append((
+        "D2b: guard without a return reds D2 only",
+        len(got) == 1 and "[B-04 D2]" in got[0] and "does not TERMINATE" in got[0],
+        got,
+    ))
+
     # D3a: placeholders kept (funnel bypassed) — reds D3 funnel only.
     n4 = {rel: DRAIN_CLEAN.replace("        removeQueuedPlaceholders(queuedIds)\n", "")}
     got = run(n4)
@@ -1257,8 +1467,30 @@ def staged_self_test():
 """,
     ))
     got = run(n4)
-    ok = (len(got) == 1 and "[A-07 S2]" in got[0] and "AFTER the write" in got[0])
-    results.append(("S2b: guard after the write reds the order finding only", ok, got))
+    # [wide-1024] This fixture now breaks TWO criteria at once — the guard runs
+    # after the write AND its result is never consumed — so both findings are
+    # required. The second one is the witnessed shape (`val admission = …` kept,
+    # `when` deleted) that used to pass the whole section.
+    ok = (len(got) == 2
+          and any("[A-07 S2]" in f and "AFTER the write" in f for f in got)
+          and any("[A-07 S2]" in f and "BOUND and never consumed" in f for f in got))
+    results.append(("S2b: guard after the write + unconsumed decision red both order and "
+                    "consumption criteria", ok, got))
+
+    # [wide-1024 witness] the exact shape the external auditor used: the guards
+    # are called, the result is bound, and the write/credit lines are lifted out
+    # of the `when` so an over-cap share lands on disk anyway.
+    n4b = clean_tree(activity=_staged_activity(
+        STAGED_ATTACH_CLEAN.split("                when (admission) {")[0]
+        + "                File(dir(), name()).writeText(d.text, Charsets.UTF_8)\n"
+        + "                stagedBytes.credit(textBytes)\n"
+        + "                out += Item(name())\n"
+        + "            }\n",
+    ))
+    got = run(n4b)
+    ok = (len(got) == 1 and "[A-07 S2]" in got[0] and "BOUND and never consumed" in got[0])
+    results.append(("S2c: bound-but-unconsumed admission decision reds only the consumption "
+                    "criterion", ok, got))
 
     # S2e: char count instead of the UTF-8 byte funnel — reds byteCount only.
     n7 = clean_tree(activity=_staged_activity(
@@ -1498,6 +1730,18 @@ def share_stream_self_test():
           sum(1 for f in got if "[A-08 G3]" in f and "never bound" in f) == 1 and
           sum(1 for f in got if "[A-08 G4]" in f) == 1)
     results.append(("A08-7: unbound copy outcome reds G3 (+G4: no success gate)", ok, got))
+
+    # [wide-1024 witness] G3b: the outcome IS bound, the Failed arm is there and
+    # still logged — it now RETURNS the staged filename, so a copy that staged
+    # nothing hands the caller a name for a file that does not exist.
+    got = run(
+        _share_stream_activity(STREAM_CORE_CLEAN)
+        .replace("            is Copy.Failed -> null\n",
+                 "            is Copy.Failed -> name()\n")
+    )
+    ok = (len(got) == 1 and "[A-08 G3]" in got[0]
+          and "instead of failing" in got[0] and "ghost attachment" in got[0])
+    results.append(("A08-6b: a Failed arm that yields the staged name reds G3", ok, got))
 
     # A08-10: the inlined regression — the function acquires the stream itself
     #         and returns a filename with no success gate (G4).

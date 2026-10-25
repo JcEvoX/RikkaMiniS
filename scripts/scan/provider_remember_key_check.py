@@ -629,26 +629,211 @@ def func_body(code, name):
     return None
 
 
+# ---- [wide-1024] grade the VALUE, not the spelling ------------------------
+# The wide sweep proved this family blind in one direction: every criterion here
+# asked whether a NAMED thing is present (`'instances' in keys`, `'entriesFor('
+# in the window, one `+= 1` in the body, `model = entry.model` NOT followed by
+# a dot). Each witness kept the name and broke the flow — the key was dropped
+# while the identifier stayed in the block, the fresh read moved into a
+# discarded lambda, the bump was cancelled one line later, the raw carrier got
+# a `.copy()` appended. So the helpers below answer "what VALUE does this
+# expression produce", and the criteria grade that.
+_STATE_DELEGATE_RE = re.compile(
+    r"\b(?:remember\w*|mutableStateOf|collectAsState\w*|produceState|derivedStateOf)\b")
+
+
+def state_carrier_names(code):
+    """Identifiers holding a value that changes OUTSIDE the composition inputs:
+    a delegated / `remember`-backed state, a `collectAsState()` flow read, or a
+    value a producer effect assigns.
+
+    `val instances = config.instances` is deliberately NOT one: it is a plain
+    read of the config the caller already passed in (C1's `instances` /
+    `modelEntries` rules grade those two by name)."""
+    names = set()
+    for m in VAL_DECL_RE.finditer(code):
+        name = m.group(1)
+        head = code[m.end():]
+        if head.startswith("by"):
+            if _STATE_DELEGATE_RE.search(head[2:head.find("\n") if "\n" in head else len(head)]):
+                names.add(name)
+            elif _STATE_DELEGATE_RE.search(statement_tail(code, m.end())):
+                names.add(name)
+            continue
+        if _STATE_DELEGATE_RE.search(statement_tail(code, m.end())):
+            names.add(name)
+    for effect in EFFECT_CALLS:
+        for _line_no, _keys, _span, init in iter_remember_calls(code, effect):
+            for am in re.finditer(r"(?m)^[ \t]*([A-Za-z_]\w*)\s*=[^=]", init):
+                names.add(am.group(1))
+    return names
+
+
+_SNAPSHOT_DECL_RE = re.compile(
+    r"(?m)^[ \t]*(?:val|var)\s+([A-Za-z_]\w*)\s*(?::[^=\n]*)?=\s*remember\w*\s*[({]")
+
+
+def composition_snapshots(code):
+    """Names bound to a PLAIN value computed during composition
+    (`val x = remember(k) { … }`). A closure captures the value, so reading one
+    AFTER an async call reads the PRE-call list — that is the stale-count defect
+    C7 grades."""
+    return set(_SNAPSHOT_DECL_RE.findall(code))
+
+
+def _strip_passthrough(expr):
+    """[expr] with every `.also { … }` / `.apply { … }` block removed.
+
+    Both return their RECEIVER, so whatever they compute is discarded by value:
+    `allEntries.size.also { entriesFor(id) }` still evaluates to the stale
+    count. Treating the two as "the value" is the spelling axis this gate was
+    blind on."""
+    out = expr
+    for name in ("also", "apply"):
+        while True:
+            m = re.search(r"\.\s*%s\s*\{" % name, out)
+            if not m:
+                break
+            close = _balanced_span(out, out.index("{", m.start()), "{", "}")
+            if close < 0:
+                break  # unparseable → leave it in place, the caller stays red
+            out = out[:m.start()] + out[close:]
+    return out
+
+
+def local_value_decls(code):
+    """name -> initializer / delegate expression for file-local `val` / `var`
+    declarations. Functions are excluded on purpose: a callee's body is not a
+    value the caller's argument carries."""
+    out = {}
+    for m in VAL_DECL_RE.finditer(code):
+        out.setdefault(m.group(1), statement_tail(code, m.end()))
+    return out
+
+
+FRESH_ENTRIES_RE = re.compile(r"\b(?:entriesFor|entries|visibleEntries)\s*\(")
+
+
+def _balanced_span(text, open_idx, opener, closer):
+    """Index just past the [closer] matching [open_idx], or -1 (string-aware:
+    braces inside literals do not count)."""
+    depth = 0
+    quote = None
+    i = open_idx
+    while i < len(text):
+        ch = text[i]
+        if quote:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+        elif ch in "\"'":
+            quote = ch
+        elif ch == opener:
+            depth += 1
+        elif ch == closer:
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return -1
+
+
+def expression_value_chain(expr, decls, depth=0, seen=None):
+    """[expr] plus the initializer chain of the file-local names it uses, with
+    pass-through scope functions removed at every level.
+
+    A decision expressed through a local must be graded as one expression:
+    `val total = allEntries.size` then `refreshResultMessage(result, total, ctx)`
+    reads the snapshot just as surely as the inline spelling did."""
+    out = [_strip_passthrough(expr or "")]
+    if depth >= 3:
+        return out
+    seen = seen or set()
+    for name in set(IDENT_RE.findall(expr or "")):
+        if name in seen:
+            continue
+        sub = decls.get(name)
+        if sub is None:
+            continue
+        out.extend(expression_value_chain(sub, decls, depth + 1, seen | {name}))
+    return out
+
+
+def _top_level_split(text, sep=","):
+    """Split [text] on [sep] at zero (), [], {} depth (string-aware)."""
+    parts, buf, depth, quote = [], [], 0, None
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if quote:
+            buf.append(ch)
+            if ch == "\\" and i + 1 < len(text):
+                buf.append(text[i + 1])
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+        elif ch in "\"'":
+            quote = ch
+            buf.append(ch)
+        elif ch in "([{":
+            depth += 1
+            buf.append(ch)
+        elif ch in ")]}":
+            depth -= 1
+            buf.append(ch)
+        elif ch == sep and depth == 0:
+            parts.append("".join(buf))
+            buf = []
+        else:
+            buf.append(ch)
+        i += 1
+    parts.append("".join(buf))
+    return [p.strip() for p in parts]
+
+
 def check_provider_list(code):
     """C1, C2, C4. Returns list of (criterion_id, ok, detail)."""
     results = []
     lines = [ln for ln in code.split("\n")]
 
     # --- C1: providerRows remember keys ---
-    c1_line = None
-    for ln in lines:
-        if "val providerRows" in ln and "remember(" in ln:
-            c1_line = ln
+    # [wide-1024] Two grades now: the two config inputs by name, AND every
+    # state-carrier the initializer actually reads. The sweep's witness dropped
+    # `apiKeyByInstanceId` from the key list while the block still read it
+    # (`val apiKey = apiKeyByInstanceId[instance.id]`), so the rows kept the
+    # PRE-write credential snapshot forever: neither `instances` nor the entry
+    # list moves when a key is written from ProviderDetailScreen / minis-config.
+    c1_call = None
+    for line_no, keys, span, init in iter_remember_calls(code, "remember"):
+        decl = code.split("\n")[line_no - 1] if line_no - 1 < len(code.split("\n")) else ""
+        if "val providerRows" in decl or "val providerRows" in span.split("\n")[0]:
+            c1_call = (keys, init)
             break
-    if c1_line is None:
+    if c1_call is None:
         results.append(("C1", False, "anchor `val providerRows ... remember(` not found (fail-closed)"))
     else:
-        keys = remember_keys(c1_line)
+        keys, init = c1_call
         if keys is None:
             results.append(("C1", False, "providerRows line has no remember( call"))
         else:
-            ok = "instances" in keys and "modelEntries" in keys
-            results.append(("C1", ok, "keys=[%s]" % keys.strip()))
+            carriers = state_carrier_names(code)
+            carriers.discard("providerRows")
+            unkeyed = sorted(
+                c for c in carriers
+                if re.search(r"\b%s\b" % re.escape(c), init) and c not in keys)
+            ok = ("instances" in keys and "modelEntries" in keys and not unkeyed)
+            if unkeyed:
+                results.append(("C1", False,
+                                "keys=[%s] — the initializer reads the state carrier(s) %s "
+                                "that are not keyed: the block re-derives only when the config "
+                                "inputs move, so a value produced elsewhere (credential / "
+                                "effect-published snapshot) stays frozen at its first read"
+                                % (keys.strip(), ", ".join(unkeyed))))
+            else:
+                results.append(("C1", ok, "keys=[%s]" % keys.strip()))
 
     # --- C2: reorderableRows remember keys ---
     c2_line = None
@@ -721,17 +906,63 @@ def check_provider_detail(code):
                     % (rm_pos, msg_pos)))
     args = call_args(code, msg_pos) or ""
     path = code[rm_pos:msg_pos + len(args) + 2]
-    reassigned = re.search(r"\ballEntries\s*=[^=]", path) is not None
-    stale = "allEntries" in args and not reassigned
+    # [wide-1024] Graded on the VALUE each toast argument carries, not on which
+    # identifiers appear nearby. The sweep's witness kept both anchors —
+    # `entriesFor(instance.id)` still sat in the window and `allEntries.size`
+    # no longer ended the line — by writing
+    #   val total = allEntries.size.also { providerRepository.entriesFor(instance.id) }
+    # `.also` returns its receiver, so the toast still reported the pre-fetch
+    # count while every substring check was satisfied.
+    decls = local_value_decls(code)
+    snapshots = composition_snapshots(code)
+    carriers = state_carrier_names(code)
+    reassigned = set(
+        n for n in carriers
+        if re.search(r"(?m)^[ \t]*%s\s*=[^=]" % re.escape(n), path))
+    stale, fresh = [], []
+    for arg in _top_level_split(args):
+        if not arg:
+            continue
+        chain = expression_value_chain(arg, decls)
+        value = " ‖ ".join(chain)
+        dead = sorted(n for n in snapshots
+                      if re.search(r"\b%s\b" % re.escape(n), value) and n not in reassigned)
+        if dead:
+            stale.append("%r still carries the pre-refresh snapshot %s"
+                         % (arg, ", ".join(dead)))
+        # (a) a re-read evaluated at the call site itself
+        site_fresh = bool(FRESH_ENTRIES_RE.search(_strip_passthrough(arg)))
+        # (b) a local bound ON the refresh path from a re-read
+        if not site_fresh:
+            for name in set(IDENT_RE.findall(arg)):
+                for m in re.finditer(r"(?m)^[ \t]*(?:(?:val|var)\s+)?%s\s*(?::[^=\n]*)?=[^=]"
+                                     % re.escape(name), path):
+                    if FRESH_ENTRIES_RE.search(_strip_passthrough(statement_tail(path, m.end()))):
+                        site_fresh = True
+                        break
+                if site_fresh:
+                    break
+        # (c) the accepted alternative: a state-backed list re-assigned on the path
+        if not site_fresh:
+            for name in set(IDENT_RE.findall(arg)):
+                if name in reassigned and re.search(
+                        r"(?m)^[ \t]*%s\s*=[^=]" % re.escape(name), path):
+                    tail = statement_tail(path, re.search(
+                        r"(?m)^[ \t]*%s\s*=[^=]" % re.escape(name), path).end())
+                    if not re.search(r"\b%s\b" % re.escape(name), tail):
+                        site_fresh = True
+                        break
+        if site_fresh and not dead:
+            fresh.append(arg)
     results.append(("C7b", not stale,
-                    "toast args carry no un-reassigned pre-refresh `allEntries` read" if not stale
-                    else "toast reads the pre-refresh snapshot `allEntries` (stale count)"))
-    fresh = "entriesFor(" in path
-    decl_mutable = re.search(r"(?:val|var)\s+allEntries[^\n]*mutableStateOf", code) is not None
-    ok_fresh = fresh or (decl_mutable and reassigned)
+                    "toast args carry no un-reassigned pre-refresh read" if not stale
+                    else "; ".join(stale)))
+    ok_fresh = bool(fresh)
     results.append(("C7c", ok_fresh,
-                    "refresh path re-reads entriesFor() / reassigns the state-backed list" if ok_fresh
-                    else "no fresh count read on the refresh path (entriesFor / allEntries reassignment)"))
+                    "refresh path re-reads the entry count (%s)" % ", ".join(fresh) if ok_fresh
+                    else "no argument of the toast reads a count produced ON the refresh path "
+                         "(a re-read inside a discarded receiver scope — `.also` / `.apply` — or "
+                         "a composition-time snapshot both count as stale)"))
     return results
 
 
@@ -1015,6 +1246,32 @@ def check_thinking_rules(code):
                     % ",".join(str(x) for x in producers) if not bad else "; ".join(bad)))
     return results
 
+_REVISION_WRITE_RE = re.compile(
+    r"customRulesRevision\s*\.\s*value\s*(\+\+|--|\+=|-=|\*=|/=|=(?!=))\s*([^\n;}]*)")
+
+
+def _revision_writes(body):
+    """[(deltas, problems)] for every write to `customRulesRevision.value` in
+    [body]: positive literal increments add to deltas, everything else that can
+    move the value (decrement, plain assignment, compound assignment with a
+    non-literal operand) is a problem — it can cancel the bump the criterion is
+    looking for."""
+    deltas, problems = [], []
+    for m in _REVISION_WRITE_RE.finditer(body):
+        op, tail = m.group(1), m.group(2)
+        literal = re.match(r"\s*(\d+)\s*$", tail)
+        if op == "+=" and literal:
+            deltas.append(int(literal.group(1)))
+        elif op == "++":
+            deltas.append(1)
+        elif op in ("-=", "--"):
+            problems.append("decrements it (`%s`)" % body[m.start():m.end()].strip())
+        else:
+            problems.append("rewrites it (`%s`, fail-closed: the net delta cannot be "
+                            "proven positive)" % body[m.start():m.end()].strip())
+    return deltas, problems
+
+
 def check_thinking_resolver(code):
     """C13 [da1030-C ISSUE-05] — every custom-rule mutator bumps the revision.
 
@@ -1036,6 +1293,22 @@ def check_thinking_resolver(code):
             continue
         if not RESOLVER_BUMP_RE.search(body):
             bad.append("%s does not bump customRulesRevision" % name)
+            continue
+        # [wide-1024] A bump that is cancelled is not a bump. The sweep's
+        # witness appended `_customRulesRevision.value -= 1` after the `+= 1`:
+        # the revision lands back on its old value, MutableStateFlow suppresses
+        # the emission (equal value), and every collector — ChatScreen,
+        # QuickTestSheet, ProviderDetailScreen — never learns the rule set
+        # changed. Graded on the NET delta of every write in the body.
+        deltas, problems = _revision_writes(body)
+        if problems:
+            bad.append("%s bumps customRulesRevision but also %s — the revision "
+                       "value lands back where it started, StateFlow suppresses the "
+                       "equal emission and no collector sees the rule update"
+                       % (name, "; ".join(problems)))
+        elif sum(deltas) <= 0:
+            bad.append("%s's revision writes net to %+d (fail-closed): a non-positive "
+                       "delta cannot notify a MutableStateFlow" % (name, sum(deltas)))
     writes = len(CACHE_WRITE_RE.findall(code))
     bumps = len(RESOLVER_BUMP_RE.findall(code))
     if bumps < writes:
@@ -1877,6 +2150,7 @@ def check_credential_live_source_list(code):
 
     decls = value_sources(code)
     producers = []
+    targets = set()
     for effect in EFFECT_CALLS:
         for line_no, keys, _span, init in iter_remember_calls(code, effect):
             if not API_KEY_READ_RE.search(init):
@@ -1889,13 +2163,47 @@ def check_credential_live_source_list(code):
             if not IO_HOP_RE.search(init):
                 continue
             producers.append(line_no)
-    results.append(("C30b", bool(producers),
-                    "the credential snapshot is produced by an effect keyed on the instance "
-                    "list + config revision, reading through an IO hop (L%s)"
-                    % ",".join(str(x) for x in producers) if producers else
-                    "no producer effect keyed on (instance list, <x>.revision) that reads the "
-                    "credentials through an IO hop — an external key write changes neither "
-                    "`instances` nor `modelEntries`, so the row badges stay stale"))
+            for am in re.finditer(r"(?m)^[ \t]*([A-Za-z_]\w*)\s*=[^=]", init):
+                targets.add(am.group(1))
+    # [wide-1024] The producer existing is only half the decision: the snapshot
+    # it publishes must be CONSUMED by a derivation that re-keys on it. The
+    # sweep's witness kept the effect and the `apiKey…[id]` read inside the
+    # providerRows block, but dropped the map from the remember keys — a
+    # producer whose output is never a key is a snapshot nobody re-derives, and
+    # the row badges / masked keys stay at their first value.
+    consumers, unkeyed = [], []
+    for line_no, keys, _span, init in iter_remember_calls(code, "remember"):
+        read = sorted(t for t in targets if re.search(r"\b%s\b" % re.escape(t), init))
+        if not read:
+            continue
+        consumers.append(line_no)
+        for t in read:
+            if t not in (keys or ""):
+                unkeyed.append("L%d reads %s but keys=[%s]"
+                               % (line_no, t, " ".join((keys or "").split())))
+    ok = bool(producers) and bool(targets) and bool(consumers) and not unkeyed
+    if not producers:
+        detail = ("no producer effect keyed on (instance list, <x>.revision) that reads the "
+                  "credentials through an IO hop — an external key write changes neither "
+                  "`instances` nor `modelEntries`, so the row badges stay stale")
+    elif not targets:
+        detail = ("the credential producer's target cannot be read (fail-closed): no "
+                  "`<name> = …` assignment inside the effect body — re-derive this criterion")
+    elif not consumers:
+        detail = ("the credential snapshot is produced but never consumed — an external key "
+                  "write re-reads the credentials into a value no derivation depends on, so "
+                  "the surface keeps showing the old key")
+    elif unkeyed:
+        detail = ("the credential snapshot is consumed without being keyed: %s — the "
+                  "derivation that reads it never re-runs when the producer republishes"
+                  % "; ".join(unkeyed))
+    else:
+        detail = ("the credential snapshot is produced by an effect keyed on the instance "
+                  "list + config revision, reading through an IO hop (L%s), and consumed by "
+                  "a keyed derivation (L%s)"
+                  % (",".join(str(x) for x in producers),
+                     ",".join(str(x) for x in consumers)))
+    results.append(("C30b", ok, detail))
     return results
 
 def check_credential_live_source_connection(code):
@@ -2357,10 +2665,47 @@ def check_capability_single_source(code):
 # ---------------------------------- [dv24/B-01] quick test EXECUTION model --
 # An argument that hands the RAW entry to the worker. `entry.model.id` and
 # `entry.baseModel.id` are string IDS (the voice adapters take them as model /
-# voice names) and must keep working — hence the `(?!\s*\.)` lookahead that
-# rejects only the model CARRIER, never its `.id`.
-_QUICK_TEST_RAW_ARG_RE = re.compile(
-    r"\b(?:resolvedModel|model)\s*=\s*entry\s*\.\s*(?:baseModel|model)\b(?!\s*\.)")
+# voice names) and must keep working — the hierarchy below rejects the model
+# CARRIER (and any member of it except `.id`), never the `.id` string.
+# [wide-1024] Any member access on the raw carrier EXCEPT the `.id` string is
+# the same defect the bare carrier was: `entry.model.copy()` carries no
+# modality overrides either. Hierarchy: raw carrier → banned; `<x>.model.id` /
+# `<x>.baseModel.id` → legal (a String the voice adapter takes as its name).
+_QUICK_TEST_RAW_CARRIER_RE = re.compile(
+    r"\bentry\s*\.\s*(?:baseModel|model)\b(?!\s*\.\s*id\b)")
+_QUICK_TEST_MODEL_ARG_RE = re.compile(r"(?<![.\w])(?:resolvedModel|model)\s*=(?!=)\s*")
+_QUICK_TEST_STRING_ID_RE = re.compile(
+    r"^[A-Za-z_]\w*\s*\.\s*(?:baseModel|model)\s*\.\s*id$")
+_QUICK_TEST_ENRICHED_RE = re.compile(
+    r"\b(?:effectiveModel|enrichedModel)\b"
+    r"|ModelsDevApi\s*\.\s*(?:effectiveModel|enrichModel)\s*\("
+    r"|providerModelFor\s*\(")
+
+
+def _argument_expression(text, start):
+    """Text of the argument starting at [start], up to the comma / closing
+    bracket at zero depth (string- and bracket-aware)."""
+    depth, quote, i = 0, None, start
+    while i < len(text):
+        ch = text[i]
+        if quote:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+        elif ch in "\"'":
+            quote = ch
+        elif ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            if depth == 0:
+                break
+            depth -= 1
+        elif ch == "," and depth == 0:
+            break
+        i += 1
+    return text[start:i].strip()
 
 def _function_body(code, marker):
     """Body of the function introduced by [marker] — paren-matched signature,
@@ -2424,21 +2769,46 @@ def check_quick_test_execution(code):
         return [("C33", False,
                  "no `fun performTest(` in this surface — fail-closed, re-derive the "
                  "quick-test execution criterion instead of letting it pass vacuously")]
+    # [wide-1024] The old ban was a negative lookahead on `model = entry.model`
+    # and it had two holes: `entry.model.copy()` slipped past `(?!\s*\.)`, and
+    # only the CHAT branch was ever graded by a POSITIVE rule — the image /
+    # speech / embedding call sites were defended by "no banned spelling" alone.
+    # Both halves are now graded per argument site inside `performTest`.
     bad = [code.count("\n", 0, code.find(body)) + body.count("\n", 0, m.start()) + 1
-           for m in _QUICK_TEST_RAW_ARG_RE.finditer(body)]
+           for m in _QUICK_TEST_RAW_CARRIER_RE.finditer(body)]
     if bad:
         return [("C33", False,
-                 "the quick test executes the RAW `entry.model` at line(s) %s — the "
-                 "capability it advertised came from the effective model, and the "
-                 ":modelservice worker cannot re-derive it (no ModelsDevApi.init "
-                 "there), so image routing falls back to a chat request"
+                 "the quick test hands the worker/voice layer a RAW entry carrier at line(s) "
+                 "%s — a `.copy()` / member read of `entry.model` is exactly as un-enriched as "
+                 "the bare carrier, and the :modelservice worker cannot re-derive it (no "
+                 "ModelsDevApi.init there), so image requests fall back to a chat call"
                  % ", ".join(str(x) for x in bad))]
+    bad_args, sites = [], 0
+    for m in _QUICK_TEST_MODEL_ARG_RE.finditer(body):
+        expr = _argument_expression(body, m.end())
+        sites += 1
+        if _QUICK_TEST_STRING_ID_RE.match(expr):
+            continue  # a String id the voice adapters take as model/voice name
+        if _QUICK_TEST_ENRICHED_RE.search(expr):
+            continue
+        bad_args.append("%r" % expr[:70])
+    if not sites:
+        return [("C33", False,
+                 "`performTest` hands no `model = …` / `resolvedModel = …` argument to the "
+                 "execution layer — fail-closed, re-derive this criterion instead of letting "
+                 "it pass vacuously")]
+    if bad_args:
+        return [("C33", False,
+                 "the quick test executes an argument that carries NO enrichment at "
+                 "line(s) %s — the finished-image / voice request leaves this process "
+                 "describing the stored entry, not the effective model the card advertised"
+                 % ", ".join(bad_args))]
     if not re.search(r"ModelsDevApi\s*\.\s*effectiveModel\s*\(\s*entry\s*\)", body):
         return [("C33", False,
                  "`performTest` never resolves `ModelsDevApi.effectiveModel(entry)` — "
                  "whatever it hands the worker is the un-enriched entry")]
     return [("C33", True,
-             "performTest executes the effective model (0 raw entry.model arguments)")]
+             "performTest executes the effective model at all %d argument site(s)" % sites)]
 
 # ------------------- [dv27/B-03] System voice member presentation --------
 # A System voice entry is a VIRTUAL member: it lives in
@@ -2738,7 +3108,7 @@ LaunchedEffect(instances, config.revision) {
     }
 }
 val providerRows: List<ProviderRowData> = remember(instances, config.modelEntries, apiKeyByInstanceId) {
-    instances.map { it }
+    instances.map { instance -> instance to apiKeyByInstanceId[instance.id] }
 }
 val reorderableRows = remember(providerRows) { providerRows.distinctBy { it.instance.id } }
 onTogglePinned = remember(row.instance.id, row.instance.pinned) {
@@ -2759,7 +3129,7 @@ FIX_PROVIDER_LIST_NO_MODEL_ENTRIES = FIX_PROVIDER_LIST_CLEAN.replace(
 # (composition phase) even though the producer effect is still there. Teethed on
 # the composition-phase arm alone — C30b stays green, so this fixture pins C30a.
 FIX_PROVIDER_LIST_SYNC_READ = FIX_PROVIDER_LIST_CLEAN.replace(
-    """    instances.map { it }""",
+    """    instances.map { instance -> instance to apiKeyByInstanceId[instance.id] }""",
     """    instances.map { providerRepository.loadApiKey(it.id) }""")
 
 # the baseline shape: the row snapshot is read inside the providerRows remember
@@ -2774,7 +3144,7 @@ FIX_PROVIDER_LIST_PRE_BASELINE = FIX_PROVIDER_LIST_CLEAN.replace(
 """, "").replace(
     "remember(instances, config.modelEntries, apiKeyByInstanceId)",
     "remember(instances, config.modelEntries)").replace(
-    "    instances.map { it }",
+    "    instances.map { instance -> instance to apiKeyByInstanceId[instance.id] }",
     "    instances.map { providerRepository.loadApiKey(it.id) }")
 
 # the effect still exists but is keyed on the instance list only: an external
@@ -4305,6 +4675,46 @@ FIX_MODEL_PICKER_SHEET_MEMBER_LABEL_BARE = FIX_MODEL_PICKER_SHEET_CLEAN.replace(
     )""",
     """    return instance?.label.orEmpty()""")
 
+# --- [wide-1024] the values-not-spellings fixtures -------------------------
+# Each one is a witness the external sweep used to walk through this gate: the
+# named anchor stayed where the criterion looked, the VALUE stopped flowing.
+
+# C1 + C30b: the credential snapshot is still read by the rows block, but it is
+# no longer a remember key — an external key write re-reads the map into a
+# value nothing re-derives from, so the badges keep the first snapshot forever.
+FIX_PROVIDER_LIST_NO_CREDENTIAL_KEY = _replace_exactly(
+    FIX_PROVIDER_LIST_CLEAN,
+    "remember(instances, config.modelEntries, apiKeyByInstanceId)",
+    "remember(instances, config.modelEntries)")
+
+# C7b/C7c: the fresh read survives inside a receiver scope that DISCARDS it
+# (`.also` returns its receiver), so the toast still reports the pre-fetch count.
+FIX_PROVIDER_DETAIL_LET_THROUGH = _replace_exactly(
+    FIX_PROVIDER_DETAIL_CLEAN,
+    "        val total = providerRepository.entriesFor(instance.id).size",
+    "        val total = allEntries.size.also { providerRepository.entriesFor(instance.id) }")
+
+# C13: the bump is present and then cancelled in the same body — the revision
+# lands on its old value, MutableStateFlow suppresses the equal emission.
+FIX_RESOLVER_CANCELLED_BUMP = _replace_exactly(
+    FIX_THINKING_RESOLVER_CLEAN,
+    """    fun setCustomRules(instanceId: String, rules: List<ThinkingRule>) {
+        customRulesCache = withInstanceRules(customRulesCache, instanceId, rules)
+        _customRulesRevision.value += 1
+    }""",
+    """    fun setCustomRules(instanceId: String, rules: List<ThinkingRule>) {
+        customRulesCache = withInstanceRules(customRulesCache, instanceId, rules)
+        _customRulesRevision.value += 1
+        _customRulesRevision.value -= 1
+    }""")
+
+# C33: the raw carrier grew a `.copy()` — the old lookahead only rejected the
+# BARE `entry.model`, so an un-enriched copy walked through the image branch.
+FIX_QUICK_TEST_RAW_CARRIER_COPY = _replace_exactly(
+    FIX_QUICK_TEST_CLEAN,
+    "ProviderExecutionGateway.generateImage(model = effectiveModel)",
+    "ProviderExecutionGateway.generateImage(model = entry.model.copy())")
+
 CLEAN_TREE = {
     REL_PROVIDER_LIST: FIX_PROVIDER_LIST_CLEAN,
     REL_SHEET: FIX_SHEET_CLEAN,
@@ -4409,10 +4819,13 @@ def run_selftest():
     run_case("failclosed-missing-sheet-anchor", 1,
              variant(REL_SHEET, FIX_SHEET_MISSING_ANCHOR), failures, ("C3",))
     # comment must not satisfy criteria (KDoc quoting an anchor is not the anchor)
+    # wide-1024: C30b joins the expectation — with the rows block commented out
+    # the file genuinely has NO consumer of the credential snapshot, which the
+    # new consumption arm grades red on its own.
     commented = FIX_PROVIDER_LIST_NO_MODEL_ENTRIES.replace(
         "val providerRows", "// val providerRows") + "\n// onTogglePinned = remember(instances) {}\n"
     run_case("comments-do-not-count", 1,
-             variant(REL_PROVIDER_LIST, commented), failures, ("C1",))
+             variant(REL_PROVIDER_LIST, commented), failures, ("C1", "C30b"))
     # --- dv22-B3: C33 (capability single source) --------------------------
     run_case("c33-raw-local-model", 1,
              variant(REL_QUICK_TEST, FIX_QUICK_TEST_RAW_LOCAL), failures, ("C33",))
@@ -4443,6 +4856,9 @@ def run_selftest():
              variant(REL_QUICK_TEST, FIX_QUICK_TEST_RAW_PERFORM_MODEL), failures, ("C33",))
     run_case("c33-quick-test-no-perform-enrich", 1,
              variant(REL_QUICK_TEST, FIX_QUICK_TEST_NO_PERFORM_ENRICH), failures, ("C33",))
+    # --- wide-1024: the raw carrier with a member access is still the carrier
+    run_case("c33-quick-test-raw-carrier-copy", 1,
+             variant(REL_QUICK_TEST, FIX_QUICK_TEST_RAW_CARRIER_COPY), failures, ("C33",))
 
     # --- da1026-C: C5 (connection screen) ---------------------------------
     run_case("c5-conn-no-baseurl-key", 1,
@@ -4479,7 +4895,13 @@ def run_selftest():
              variant(REL_ENTRY_DETAIL, FIX_ENTRY_DETAIL_WRONG_KEY), failures, ("C6c",))
     run_case("failclosed-missing-entry-anchor", 1,
              variant(REL_ENTRY_DETAIL, FIX_ENTRY_DETAIL_MISSING_ANCHOR), failures, ("C6",))
-    # --- da1026-C: C7 (refresh toast count) --------------------------------
+    # --- wide-1024: the value, not the spelling ---------------------------
+    run_case("c1-credential-key-dropped", 1,
+             variant(REL_PROVIDER_LIST, FIX_PROVIDER_LIST_NO_CREDENTIAL_KEY), failures,
+             ("C1", "C30b"))
+    run_case("c7bc-fresh-read-in-discarded-scope", 1,
+             variant(REL_PROVIDER_DETAIL, FIX_PROVIDER_DETAIL_LET_THROUGH), failures,
+             ("C7b", "C7c"))
     run_case("c7b-detail-stale-snapshot", 1,
              variant(REL_PROVIDER_DETAIL, FIX_PROVIDER_DETAIL_STALE), failures, ("C7b", "C7c"))
     run_case("c7c-detail-no-fresh-read", 1,
@@ -4558,6 +4980,9 @@ def run_selftest():
              variant(REL_THINKING_RESOLVER, FIX_RESOLVER_NO_BUMP_RESTORE), failures, ("C13",))
     run_case("c13-no-revision-declaration", 1,
              variant(REL_THINKING_RESOLVER, FIX_RESOLVER_NO_DECL), failures, ("C13",))
+    # wide-1024: a bump that is cancelled one line later is not a bump
+    run_case("c13-cancelled-bump", 1,
+             variant(REL_THINKING_RESOLVER, FIX_RESOLVER_CANCELLED_BUMP), failures, ("C13",))
     run_case("failclosed-missing-thinking-resolver", 1,
              missing(REL_THINKING_RESOLVER), failures, ("FILE",))
     run_case("c11c-detail-call-site-undrilled", 1,
@@ -4681,8 +5106,11 @@ def run_selftest():
     run_case("c29-detail-key-without-revision", 1,
              variant(REL_PROVIDER_DETAIL, FIX_PROVIDER_DETAIL_KEY_NO_REVISION), failures, ("C29",))
     # --- da1041-B1: C30 / C31 (the credential live source) -----------------
+    # wide-1024: C30b joins — the sync read leaves the producer's output
+    # unconsumed (the screen reads keys at composition instead).
     run_case("c30-list-sync-read", 1,
-             variant(REL_PROVIDER_LIST, FIX_PROVIDER_LIST_SYNC_READ), failures, ("C30a",))
+             variant(REL_PROVIDER_LIST, FIX_PROVIDER_LIST_SYNC_READ), failures,
+             ("C30a", "C30b"))
     run_case("c30-list-pre-baseline", 1,
              variant(REL_PROVIDER_LIST, FIX_PROVIDER_LIST_PRE_BASELINE), failures,
              ("C30a", "C30b"))

@@ -72,6 +72,65 @@ ALLOWLIST_REASON = (
 
 URI_PARSE_PATH_RE = re.compile(r"Uri\.parse\s*\([^()]*\)\s*\.\s*path\b", re.S)
 
+# [wide-1024] `decodeUriPath(...)` alone says nothing about what happens to its
+# RESULT. Chaining a delimiter cut onto it re-introduces exactly the `#`/`?`
+# truncation the resolver exists to prevent, so the resolved value must be used
+# as-is. These are the chain calls that rewrite it.
+POST_DECODE_POISON_RE = re.compile(
+    r"^\s*\.\s*(substringBefore|substringAfter|substring|replace|split|trim|trimEnd|"
+    r"trimStart|removePrefix|removeSuffix)\b")
+# A literal in front of a guard makes the guard dead — `true || gate` and
+# `false && gate` keep the gate's spelling while nothing is ever decided by it.
+DEAD_GUARD_RE = re.compile(r"\bfalse\s*&&|\btrue\s*\|\|")
+HTTP_TEST_RE = re.compile(r'startsWith\(\s*"https?://')
+
+
+def _match_paren(text, open_idx):
+    depth = 0
+    for j in range(open_idx, len(text)):
+        if text[j] == "(":
+            depth += 1
+        elif text[j] == ")":
+            depth -= 1
+            if depth == 0:
+                return j
+    return -1
+
+
+def post_decode_poison(text, call_token):
+    """None when the resolver's value flows on unchanged, else the reason."""
+    n = text.count(call_token)
+    if n != 1:
+        return "resolver `%s` must appear exactly once in the branch (found %d)" % (call_token, n)
+    i = text.index(call_token)
+    open_idx = text.find("(", i + len("decodeUriPath"))
+    if open_idx < 0:
+        return "cannot locate the resolver's argument list (fail-closed)"
+    close = _match_paren(text, open_idx)
+    if close < 0:
+        return "unbalanced parentheses after `%s` (fail-closed)" % call_token
+    m = POST_DECODE_POISON_RE.match(text[close + 1: close + 80])
+    if m:
+        return ("the decoded path is rewritten by `.%s…` — the resolver's value must be "
+                "used as-is" % m.group(1))
+    return None
+
+
+def last_if_cond(text, idx):
+    """Condition of the innermost `if (…)` that has closed before `idx`.
+
+    Used to ask "what decides whether this cut happens?" without pinning lines.
+    None when the subject sits outside any `if` — fail-closed at the call site.
+    """
+    best = None
+    for m in re.finditer(r"\bif\s*\(", text[:idx]):
+        p = text.find("(", m.start())
+        q = _match_paren(text, p)
+        if q < 0 or q > idx:
+            continue
+        best = text[p + 1:q]
+    return best
+
 
 def strip_comments(src):
     """Remove // and /* */ comments, string-literal aware (see
@@ -153,9 +212,15 @@ def analyse(sheet_code, md_code, holder_code, ui_codes):
 
     # --- F1: openExternalFromSheet ------------------------------------
     branch = branch_slice(sheet, 'url.startsWith("file://")', 30)
-    ok1 = "decodeUriPath(url.removePrefix(\"file://\"))" in branch
+    ok1 = 'decodeUriPath(url.removePrefix("file://"))' in branch
+    detail1 = "branch slice does not contain the fixed resolver" if not ok1 else ""
+    if ok1:
+        # [wide-1024] …and the resolved value must not be re-cut downstream.
+        poison = post_decode_poison(branch, 'decodeUriPath(url.removePrefix("file://"))')
+        ok1 = poison is None
+        detail1 = poison or "decoded path used as-is"
     results.append(("F1a sheet file:// branch resolves via decodeUriPath(url.removePrefix(\"file://\"))",
-                    ok1, "branch slice does not contain the fixed resolver" if not ok1 else "", None))
+                    ok1, detail1, None))
     n1 = count_uri_parse_path(sheet)
     results.append(("F1b no Uri.parse(...).path in WebPreviewBottomSheet.kt",
                     n1 == 0, "found %d occurrence(s)" % n1, None))
@@ -163,8 +228,13 @@ def analyse(sheet_code, md_code, holder_code, ui_codes):
     # --- F2: resolveMdMediaFile ---------------------------------------
     md_branch = branch_slice(md, 'stripped.startsWith("file://")', 20)
     ok2 = "decodeUriPath(stripped.removePrefix(\"file://\"))" in md_branch
+    detail2 = "branch slice does not contain the fixed resolver" if not ok2 else ""
+    if ok2:
+        poison = post_decode_poison(md_branch, 'decodeUriPath(stripped.removePrefix("file://"))')
+        ok2 = poison is None
+        detail2 = poison or "decoded path used as-is"
     results.append(("F2a markdown file:// branch resolves via decodeUriPath(stripped.removePrefix(\"file://\"))",
-                    ok2, "branch slice does not contain the fixed resolver" if not ok2 else "", None))
+                    ok2, detail2, None))
     n2 = count_uri_parse_path(md)
     results.append(("F2b no Uri.parse(...).path in StreamingMarkdownText.kt",
                     n2 == 0, "found %d occurrence(s)" % n2, None))
@@ -302,11 +372,18 @@ def check_media_single_source(ui_codes):
 
     # F5c: `#` is a fragment only for http(s); in a local/minis path it may be
     # part of the file name (`foo#China.mp4`), so cutting it there mangles files.
+    # [wide-1024] The test is now the DECIDING condition, not a nearby substring:
+    # `if (true || noQuery.startsWith("http") …)` carries the test's spelling and
+    # nothing of its meaning.
     unguarded = []
     for m in re.finditer(r"substringBefore\('#", cls):
-        window = cls[max(0, m.start() - 400):m.start()]
-        if 'startsWith("http' not in window:
-            unguarded.append(m.start())
+        cond = last_if_cond(cls, m.start())
+        if cond is None:
+            unguarded.append("no enclosing if")
+        elif DEAD_GUARD_RE.search(cond):
+            unguarded.append("dead guard: %s" % cond.strip()[:48])
+        elif not HTTP_TEST_RE.search(cond):
+            unguarded.append("not an http(s) branch: %s" % cond.strip()[:48])
     parser_hash = "substringBefore('#')" in par
     chat_chain = "substringBefore('?').substringBefore('#')" in cht
     ok5c = bool(cls) and not unguarded and not parser_hash and not chat_chain
@@ -319,16 +396,32 @@ def check_media_single_source(ui_codes):
 
     # F5d: `minis:///var/minis/x` decodes to an ABSOLUTE guest path; the sites
     # that prepend "/var/minis/" must keep absolute paths untouched.
+    # [wide-1024] The guard has to be the branch's own condition and it has to be
+    # live — `if (false && decoded.startsWith("/"))` keeps the tokens, drops the
+    # decision, and doubles the prefix on every absolute path.
     guarded = 0
     unguarded_sites = []
     for rel in sorted(ui_codes):
         for line in ui_codes[rel].splitlines():
             if '"/var/minis/$decoded"' not in line:
                 continue
-            if 'startsWith("/")' in line:
-                guarded += 1
+            m = re.search(r"\bif\s*\(", line)
+            cond = None
+            if m:
+                p = line.find("(", m.start())
+                q = _match_paren(line, p)
+                if q > p:
+                    cond = line[p + 1:q]
+            if cond is None:
+                unguarded_sites.append("%s (no readable guard)" % os.path.basename(rel))
+            elif DEAD_GUARD_RE.search(cond):
+                unguarded_sites.append("%s (dead guard: %s)"
+                                       % (os.path.basename(rel), cond.strip()[:40]))
+            elif 'startsWith("/")' not in cond:
+                unguarded_sites.append("%s (guard does not test absoluteness: %s)"
+                                       % (os.path.basename(rel), cond.strip()[:40]))
             else:
-                unguarded_sites.append(os.path.basename(rel))
+                guarded += 1
     ok5d = not unguarded_sites and guarded >= 1
     results.append((
         "F5d decoded minis:// path is absolute-guarded before use",
@@ -490,6 +583,24 @@ BREAKER_FETCHER_UNGURARDED = IMAGE_FETCHER_CLEAN.replace(
     'val linuxPath = if (decoded.startsWith("/")) decoded else "/var/minis/$decoded"',
     'val linuxPath = "/var/minis/$decoded"')
 
+# [wide-1024] Three rewrites that kept every token the old criteria looked for
+# and dropped the decision those tokens were supposed to make.
+BREAKER_SHEET_POST_CUT = FIXED_SHEET.replace(
+    '            val raw = decodeUriPath(url.removePrefix("file://"))\n',
+    '            val raw = decodeUriPath(url.removePrefix("file://"))'
+    ".substringBefore('#').substringBefore('?')\n")
+assert BREAKER_SHEET_POST_CUT != FIXED_SHEET
+
+BREAKER_CLASSIFIER_DEAD_OR = MEDIA_CLASSIFIER_CLEAN.replace(
+    'return if (noQuery.startsWith("http://") || noQuery.startsWith("https://")) {',
+    'return if (true || noQuery.startsWith("http://") || noQuery.startsWith("https://")) {')
+assert BREAKER_CLASSIFIER_DEAD_OR != MEDIA_CLASSIFIER_CLEAN
+
+BREAKER_FETCHER_DEAD_GUARD = IMAGE_FETCHER_CLEAN.replace(
+    'val linuxPath = if (decoded.startsWith("/")) decoded else "/var/minis/$decoded"',
+    'val linuxPath = if (false && decoded.startsWith("/")) decoded else "/var/minis/$decoded"')
+assert BREAKER_FETCHER_DEAD_GUARD != IMAGE_FETCHER_CLEAN
+
 
 def selftest():
     failures = []
@@ -609,6 +720,34 @@ def selftest():
     # precision: the classifier's mediaBlockFrom must not be judged as a set copy
     expect(count_uri_parse_path(MEDIA_CLASSIFIER_CLEAN) == 0,
            "fixture precision: the clean classifier parses no Uri")
+
+    # ── [wide-1024] the three witnesses that walked through this gate ──────
+    # Each one keeps the token the old criterion grepped for and removes the
+    # decision behind it, so each arm asserts RED on its own criterion AND
+    # GREEN on the sibling criterion (precision).
+    m11 = analyse(BREAKER_SHEET_POST_CUT, FIXED_MD, FIXED_HOLDER, dict_of({
+        "src/android/app/src/main/java/com/rikkaminis/app/ui/preview/WebPreviewBottomSheet.kt":
+            BREAKER_SHEET_POST_CUT}))
+    d11 = {c: ok for c, ok, _, _ in m11}
+    expect(not d11["F1a sheet file:// branch resolves via decodeUriPath(url.removePrefix(\"file://\"))"],
+           "mut11 F1a must be RED when the decoded path is re-cut with substringBefore")
+    expect(d11["F1b no Uri.parse(...).path in WebPreviewBottomSheet.kt"],
+           "mut11 F1b must stay GREEN (precision)")
+
+    m12 = analyse(FIXED_SHEET, FIXED_MD, FIXED_HOLDER,
+                  dict_of({MEDIA_MODEL_REL: BREAKER_CLASSIFIER_DEAD_OR}))
+    d12 = {c: ok for c, ok, _, _ in m12}
+    expect(not d12["F5c '#' cut only inside an http(s) branch; local paths keep it"],
+           "mut12 F5c must be RED when the http(s) guard is short-circuited with `true ||`")
+    expect(d12["F5a media extension table declared once, in MarkdownBlockModel.kt"],
+           "mut12 F5a must stay GREEN (precision)")
+
+    m13 = analyse(FIXED_SHEET, FIXED_MD, FIXED_HOLDER, dict_of({
+        "src/android/app/src/main/java/com/rikkaminis/app/ui/MinisImageFetcher.kt":
+            BREAKER_FETCHER_DEAD_GUARD}))
+    d13 = {c: ok for c, ok, _, _ in m13}
+    expect(not d13["F5d decoded minis:// path is absolute-guarded before use"],
+           "mut13 F5d must be RED when the absolute-path guard is short-circuited with `false &&`")
 
     if failures:
         print("SELFTEST FAIL:")

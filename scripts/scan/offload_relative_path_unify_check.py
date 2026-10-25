@@ -283,6 +283,138 @@ def declaration_slice(text, marker):
     return text[start:]
 
 
+# ── [wide-1024] dataflow helpers ─────────────────────────────────────────────
+# The old rules asked "is the right helper named in this body?". A body that
+# computes the right value and then hands a DIFFERENT one downstream satisfies
+# that question and nothing else. These helpers answer the other question:
+# which VALUE reaches the site.
+
+def _bracket_close(text, open_idx, opener="(", closer=")"):
+    """Index of the [closer] matching text[open_idx], or -1 (fail-closed)."""
+    depth = 0
+    for i in range(open_idx, len(text)):
+        if text[i] == opener:
+            depth += 1
+        elif text[i] == closer:
+            depth -= 1
+            if depth == 0:
+                return i
+    return -1
+
+
+def _call_args(text, call):
+    """Top-level argument texts of the FIRST `call(` in [text], or None."""
+    i = text.find(call)
+    if i < 0:
+        return None
+    open_idx = i + len(call) - 1
+    close = _bracket_close(text, open_idx)
+    if close < 0:
+        return None
+    args, depth, start = [], 0, open_idx + 1
+    for k in range(open_idx + 1, close):
+        c = text[k]
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+        elif c == "," and depth == 0:
+            args.append(text[start:k])
+            start = k + 1
+    args.append(text[start:close])
+    return [a.strip() for a in args]
+
+
+def _join_symbol(body, call):
+    """Identifier bound to the [call] result (`val X = call(…)` / `X = call(…)`),
+    or None when the call is consumed inline."""
+    m = re.search(r"(?:val|var)\s+(\w+)[^=\n]*=\s*" + re.escape(call), body)
+    if m:
+        return m.group(1)
+    m = re.search(r"\b(\w+)\s*=\s*" + re.escape(call), body)
+    return m.group(1) if m else None
+
+
+def _returns(body):
+    """Every `return …` expression in [body] (a brace block is one expression)."""
+    out = []
+    for m in re.finditer(r"\breturn\b", body):
+        i, depth = m.end(), 0
+        while i < len(body):
+            c = body[i]
+            if c in "{([":
+                depth += 1
+            elif c in "})]":
+                depth -= 1
+            elif depth <= 0 and c in ";\n":
+                break
+            i += 1
+        expr = body[m.end():i].strip()
+        if expr:
+            out.append(expr)
+    return out
+
+
+def _returned_from_translation(expr, body):
+    """Is this return expression the host path the session mapping produced?
+
+    Accepted shapes: the call at the head (optionally inside `try {`), or a bare
+    local that was bound to the call. A lambda that merely CALLS the translation
+    (`raw.trim().also { resolvePathForSession(…) }`) returns the guest spelling —
+    that is the passthrough the rule exists to stop."""
+    head = re.sub(r"^try\s*\{\s*", "", expr.strip())
+    if re.match(r"(?:PRootKernel\s*\.\s*)?resolvePathForSession\s*\(", head):
+        return True
+    if re.fullmatch(r"\w+", head):
+        return re.search(r"(?:val|var)\s+" + re.escape(head) +
+                         r"\b[^\n]*resolvePathForSession\s*\(", body) is not None
+    return False
+
+
+def _dead_condition(cond):
+    """Is this `if` condition constant-folded false (`false`, `!true`, `X && false`)?"""
+    c = cond.strip()
+    if re.match(r"^false\b", c) or re.match(r"^!\s*true\b", c):
+        return True
+    return any(part.strip() == "false" for part in c.split("&&"))
+
+
+def _dead_spans(text):
+    """Spans of `if (<constant-false …>) <statement | { … }>` — dead code.
+
+    A contract site inside one is not a contract: `if (false) return error` keeps
+    every token the old rules looked for while the refusal never happens."""
+    spans = []
+    for m in re.finditer(r"\bif\s*\(", text):
+        close = _bracket_close(text, m.end() - 1)
+        if close < 0:
+            continue
+        if not _dead_condition(text[m.end():close]):
+            continue
+        j = close + 1
+        while j < len(text) and text[j] in " \t":
+            j += 1
+        if j < len(text) and text[j] == "{":
+            end = _bracket_close(text, j, "{", "}")
+            end = len(text) - 1 if end < 0 else end
+        else:
+            end, depth = j, 0
+            while end < len(text):
+                c = text[end]
+                if c in "([{":
+                    depth += 1
+                elif c in ")]}":
+                    if depth == 0:
+                        end -= 1
+                        break
+                    depth -= 1
+                elif c == "\n" and depth == 0:
+                    break
+                end += 1
+        spans.append((m.start(), end + 1))
+    return spans
+
+
 def check_source(raw):
     """Return a list of (criterion_id, message) for the given file text."""
     code = strip_comments(raw)
@@ -294,6 +426,25 @@ def check_source(raw):
     if CALL not in body("fun readLinuxPath("):
         problems.append(("C1", "readLinuxPath() does not call resolveMaybeRelative() "
                                "— it must delegate to the single join implementation"))
+    else:
+        # [wide-1024 C1] …and the joined value must be the one that gets mapped.
+        # `val resolved = resolveMaybeRelative(...)` followed by
+        # `sessionAwareHostFile(linuxPath, …)` keeps the call, drops the result:
+        # every relative --input / --system-file / image path then resolves
+        # against `/` and misses.
+        read_body = body("fun readLinuxPath(")
+        host_args = _call_args(read_body, "sessionAwareHostFile(")
+        if host_args is not None:
+            joined = _join_symbol(read_body, "resolveMaybeRelative(")
+            first = host_args[0] if host_args else ""
+            carries = (joined in first) if joined else ("resolveMaybeRelative" in first)
+            if not carries:
+                problems.append((
+                    "C1",
+                    "readLinuxPath() computes the joined path and then hands "
+                    "`%s` to sessionAwareHostFile(...) instead of the resolved value "
+                    "— a relative path is resolved, discarded, and looked up against `/`"
+                    % (first or "?")))
     if CALL not in body("fun cmdRun("):
         problems.append(("C2", "cmdRun() does not normalise --output through "
                                "resolveMaybeRelative() — a relative --output still "
@@ -328,6 +479,31 @@ def check_speech_source(raw):
     elif CALL not in resolver:
         problems.append(("S1", "resolveSourcePath() does not call resolveMaybeRelative() — a "
                                "relative --source is still refused instead of joined onto cwd"))
+    else:
+        # [wide-1024 S1/S2] the join must be FED the cwd and its result must be the
+        # value translated. `resolveMaybeRelative(trimmed, null)` keeps the call,
+        # the parameter list and the dispatch all intact while the join has
+        # nothing to join onto — the classic "checks the entry, not the consumer".
+        join_args = _call_args(resolver, CALL) or []
+        cwd_arg = join_args[1] if len(join_args) > 1 else ""
+        if not re.search(r"\bcwd\b", cwd_arg):
+            problems.append((
+                "S1",
+                "resolveSourcePath() feeds the shared join `%s` instead of the cwd "
+                "parameter — a relative --source is resolved against nothing"
+                % (cwd_arg or "<missing>")))
+            problems.append((
+                "S2",
+                "the cwd parameter no longer reaches the join — cmdTranscribe(...) "
+                "forwards request.cwd into resolveSourcePath(), which drops it"))
+        joined = _join_symbol(resolver, CALL)
+        if joined:
+            tr_args = _call_args(resolver, "resolvePathForSession(")
+            if tr_args is not None and joined not in ",".join(tr_args):
+                problems.append((
+                    "S1",
+                    "resolveSourcePath() joins the path into `%s` and then maps "
+                    "something else into the host tree — the join result is discarded" % joined))
 
     # S2 — the cwd really enters the call chain (decision point, not spelling).
     chains = CHAIN_RE.findall(strip_strings(code))
@@ -377,6 +553,21 @@ def check_speech_source(raw):
                     problems.append(("S4", "the explicit non-mic source branch returns success "
                                            "(exit 0) — a missing file must not read as a "
                                            "transcription"))
+                # [wide-1024 S4] …and the refusal has to EXECUTE. `if (false) return
+                # NativeOffloadResult(2, …)` keeps every token the rules above
+                # look for while never returning: control falls out of the branch
+                # into the live-microphone path, with the payload discarded.
+                dead = _dead_spans(cmd_body)
+                if dead:
+                    for rm in re.finditer(r"return\s+NativeOffloadResult\s*\(", branch):
+                        pos = classified + rm.start()
+                        if any(a <= pos < b for (a, b) in dead):
+                            problems.append((
+                                "S4", "the explicit non-mic source branch's refusal return is "
+                                      "wrapped in a constant-false guard (dead code) — a missing "
+                                      "or unsupported --source falls straight through to the "
+                                      "microphone"))
+                            break
     return problems
 
 
@@ -410,6 +601,18 @@ def check_shizuku_source(raw):
         problems.append(("Z3", "shizukuHostPath() does not resolve through "
                                "PRootKernel.resolvePathForSession — a guest path cannot reach the "
                                "Shizuku service's host filesystem"))
+
+    # Z2 dataflow [wide-1024] — …and the path the function RETURNS must be the one
+    # the mapping produced. `raw.trim().also { resolvePathForSession(…) }` keeps
+    # both call literals, satisfies Z3, and still hands the privileged service the
+    # guest spelling: the translation's value is thrown away at the exit.
+    if resolver and "resolvePathForSession(" in resolver:
+        rets = _returns(resolver)
+        if rets and not any(_returned_from_translation(e, resolver) for e in rets):
+            problems.append((
+                "Z2", "shizukuHostPath() returns a path that does not come from "
+                      "PRootKernel.resolvePathForSession (%s) — the guest spelling is passed "
+                      "through to the host-side service" % rets[0].splitlines()[0][:70]))
 
     # Z4 — relative-vs-absolute is the join's decision, and the join is single-source.
     if resolver and 'startsWith("/")' in resolver:
@@ -534,8 +737,7 @@ _DIRTY_IMAGE = _CLEAN.replace(
 )
 
 # All three call sites clean, but a 4th helper keeps an inline join → only C4.
-_DIRTY_INLINE_ONLY = _CLEAN.replace(
-    "    private fun readLinuxPath(linuxPath: String, cwd: String?): String? {",
+_DIRTY_INLINE_ONLY = _CLEAN.replace(    "    private fun readLinuxPath(linuxPath: String, cwd: String?): String? {",
     '    private fun otherJoin(linuxPath: String, cwd: String?): String {\n'
     '        return if (cwd.endsWith("/")) "$cwd$linuxPath" else "$cwd/$linuxPath"\n'
     "    }\n\n"
@@ -615,6 +817,42 @@ _SHIZUKU_INLINE_DECISION = _SHIZUKU_CLEAN.replace(
 )
 
 
+# ── [wide-1024] 门瞎实锤固化成臂 ────────────────────────────────────────────
+# C1: the resolved path is computed and then DISCARDED at the mapping site.
+_MODEL_SESSION_MAP = _CLEAN.replace(
+    "    private fun readLinuxPath(linuxPath: String, cwd: String?): String? {\n"
+    "        val resolved = resolveMaybeRelative(linuxPath, cwd)\n"
+    "        return resolved\n"
+    "    }",
+    "    private fun readLinuxPath(linuxPath: String, sessionId: String?, cwd: String?): String? {\n"
+    "        val resolved = resolveMaybeRelative(linuxPath, cwd)\n"
+    "        val hostFile: File = sessionAwareHostFile(resolved, sessionId) ?: return null\n"
+    "        if (!hostFile.exists() || !hostFile.isFile) return null\n"
+    "        return hostFile.readText()\n"
+    "    }",
+)
+_MODEL_RAW_ARG = _MODEL_SESSION_MAP.replace(
+    "sessionAwareHostFile(resolved, sessionId)",
+    "sessionAwareHostFile(linuxPath, sessionId)",
+)
+# S1/S2: the join is still called, but with `null` instead of the cwd parameter.
+_SPEECH_NULL_CWD = _SPEECH_CLEAN.replace(
+    "        val guestPath = resolveMaybeRelative(trimmed, cwd)",
+    "        val guestPath = resolveMaybeRelative(trimmed, null)",
+)
+# S4: the refusal keeps every token the rule reads and is dead code.
+_SPEECH_DEAD_REFUSAL = _SPEECH_CLEAN.replace(
+    "            return NativeOffloadResult(2, OffloadOutput.formatBody(body, args))",
+    "            if (false) return NativeOffloadResult(2, OffloadOutput.formatBody(body, args))",
+)
+# Z2: both call literals stay, the translation's value is thrown away at the exit.
+_SHIZUKU_PASSTHROUGH = _SHIZUKU_CLEAN.replace(
+    "        return PRootKernel.resolvePathForSession(request.sessionId, guestPath, context)?.absolutePath",
+    "        return raw.trim().also { "
+    "PRootKernel.resolvePathForSession(request.sessionId, guestPath, context) }",
+)
+
+
 def _fixture_root(model_text, speech_text=_SPEECH_CLEAN, shizuku_text=_SHIZUKU_CLEAN):
     root = tempfile.mkdtemp(prefix="offload-relpath-gate-selftest-")
     for rel, text in ((TARGET_REL, model_text), (SPEECH_REL, speech_text),
@@ -649,6 +887,17 @@ def selftest():
          _CLEAN, {"Z3"}, _SPEECH_CLEAN, _SHIZUKU_GUEST_ONLY),
         ("Z4: a second relative-vs-absolute decision inside the resolver",
          _CLEAN, {"Z4"}, _SPEECH_CLEAN, _SHIZUKU_INLINE_DECISION),
+        # ── [wide-1024] dataflow arms: the right API is named, the wrong value moves ──
+        ("clean: readLinuxPath maps the RESOLVED path (session-aware shape)",
+         _MODEL_SESSION_MAP, set()),
+        ("C1: readLinuxPath resolves the path and then maps the raw argument",
+         _MODEL_RAW_ARG, {"C1"}),
+        ("S1S2: the Speech join is fed `null` instead of the cwd parameter",
+         _CLEAN, {"S1", "S2"}, _SPEECH_NULL_CWD),
+        ("S4: the refusal return is wrapped in `if (false)` (dead code)",
+         _CLEAN, {"S4"}, _SPEECH_DEAD_REFUSAL),
+        ("Z2: shizukuHostPath returns the guest spelling, not the mapped host path",
+         _CLEAN, {"Z2"}, _SPEECH_CLEAN, _SHIZUKU_PASSTHROUGH),
     ]
     failures = []
     for case in cases:
@@ -669,8 +918,8 @@ def selftest():
     if failures:
         print("❌ selftest failed: %s" % ", ".join(failures))
         return 1
-    print("OFFLOAD_RELATIVE_PATH_UNIFY_SELFTEST=PASS (13 fixtures: 12 violation "
-          "shapes caught, clean tree green)")
+    print("OFFLOAD_RELATIVE_PATH_UNIFY_SELFTEST=PASS (18 fixtures: 16 violation "
+          "shapes caught, 2 clean shapes green)")
     return 0
 
 

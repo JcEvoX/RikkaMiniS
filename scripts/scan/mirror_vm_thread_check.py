@@ -276,6 +276,124 @@ def fail(*parts):
     VIOLATIONS.append(": ".join(str(x) for x in parts))
 
 
+# ── wide-1024 helpers ─────────────────────────────────────────────────────
+# Three blind spots, one family: the gate asked whether a text was PRESENT,
+# never whether the value it computes survives to the place that matters.
+#   * arm 1 saw `Snapshot.withMutableSnapshot` containing both map names, and
+#     missed the same writes sitting right below it, outside the transaction;
+#   * arm 2 saw `applyMirror(` in the body, and missed it wrapped in
+#     `if (false) { … }`;
+#   * arms 5/7 saw the guard's tokens, and missed `&& false` on the condition
+#     plus a prior-selection set built as `emptySet().also { selectedMirrorId.keys }`.
+
+DEAD_GUARD_RE = re.compile(r"&&\s*false\b|\|\|\s*true\b|\band\s+false\b")
+DEAD_IF_RE = re.compile(r"\b(?:if|while)\s*\(\s*(?:false|true)\s*\)")
+
+
+def enclosing_heads(src: str, idx: int):
+    """Heads of every `{ … }` block enclosing [idx], innermost first. The head
+    is the text on the line before the brace (`if (false)`, `for (x in y)`,
+    `withContext(Dispatchers.Main)`, `null.also`)."""
+    heads = []
+    depth = 0
+    i = idx
+    while i >= 0:
+        c = src[i]
+        if c == "}":
+            depth += 1
+        elif c == "{":
+            if depth == 0:
+                j = i - 1
+                while j >= 0 and src[j] in " \t\n":
+                    j -= 1
+                end = j + 1
+                while j >= 0 and src[j] not in "\n;{}":
+                    j -= 1
+                heads.append(src[j + 1:end].strip())
+            else:
+                depth -= 1
+        i -= 1
+    return heads
+
+
+def is_constant_false(head: str) -> bool:
+    """`if (false)`, `if (cond && false)`, `while (false)`, `list.take(0)` —
+    a guard/iterable that can never let the statement inside run."""
+    if re.search(r"\.take\s*\(\s*0\s*\)", head):
+        return True
+    if re.search(r"\b(?:emptyList|emptySet|emptyMap)\s*\(\s*\)", head):
+        return True
+    if DEAD_IF_RE.search(head):
+        return True
+    if DEAD_GUARD_RE.search(head):
+        return True
+    return False
+
+
+def dead_context(src: str, idx: int):
+    """The head of the enclosing construct that makes the statement at [idx]
+    unreachable, or None. Also catches the braceless spelling
+    (`if (false) applyMirror(...)`)."""
+    for head in enclosing_heads(src, idx):
+        if is_constant_false(head):
+            return head
+    line_start = src.rfind("\n", 0, idx) + 1
+    prefix = src[line_start:idx]
+    if re.search(r"\b(?:if|while)\s*\(\s*false\s*\)\s*$", prefix):
+        return prefix.strip()
+    return None
+
+
+def in_discarded_lambda(src: str, idx: int) -> bool:
+    """`x.also { … }` / `x.apply { … }` keep their RECEIVER and throw the
+    block's value away — a read made there reaches nothing."""
+    for head in enclosing_heads(src, idx):
+        if head.endswith(".also") or head.endswith(".apply"):
+            return True
+    return False
+
+
+def statement_expr(text: str, pos: int, limit: int = 400) -> str:
+    depth = 0
+    i = pos
+    n = min(len(text), pos + limit)
+    while i < n:
+        c = text[i]
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            if depth == 0:
+                break
+            depth -= 1
+        elif c == "\n" and depth == 0:
+            nxt = text[i + 1:].lstrip(" \t")
+            if not nxt.startswith(("?.", ".", "?:", "&&", "||")):
+                break
+        i += 1
+    return text[pos:i]
+
+
+def prior_selection_value_problem(detect: str) -> str:
+    """Every binding that reads `selectedMirrorId` as the prior-selection set
+    must PUBLISH that read. Returns '' when the value survives."""
+    found = False
+    for m in re.finditer(r"\b(?:val|var)\s+([A-Za-z_]\w*)\s*(?::[^=\n]*)?=\s*", detect):
+        expr = statement_expr(detect, m.end())
+        pos = expr.find("selectedMirrorId")
+        if pos < 0:
+            continue
+        found = True
+        if in_discarded_lambda(expr, pos):
+            return ("`" + m.group(1) + "` reads selectedMirrorId inside .also/.apply, so the "
+                    "value carried forward is the receiver (an empty set), not the prior "
+                    "selection — the settlement overwrites the user's pick")
+    if not found:
+        return ("no local carries `selectedMirrorId` into the settlement decision "
+                "(fail-closed) — prior selection cannot be honoured")
+    return ""
+
+
+
 def check(root: Path) -> None:
     p = root / REL_SCREEN
     if not p.exists():
@@ -295,6 +413,21 @@ def check(root: Path) -> None:
             snap = r[0]
             if "selectedMirrorId[cat]" not in snap or "useCustomMirror[cat]" not in snap:
                 fail(REL_SCREEN, "ensureLoaded snapshot block does not cover both state-map writes")
+            # [wide-1024 arm 1] the transaction must cover EVERY write in the
+            # function, not merely contain the two names once: the same loop
+            # duplicated below the block re-opens the background-thread defect
+            # (boot path enters on Dispatchers.IO). Blank the transactions and
+            # judge what is left.
+            end = r[1]
+            start = end - len(snap)
+            masked = body[:start] + " " * len(snap) + body[end:]
+            stray = re.search(r"\b(?:selectedMirrorId|useCustomMirror)\s*\[[^\]]*\]\s*=", masked)
+            if stray:
+                fail(REL_SCREEN,
+                     "ensureLoaded writes the state maps outside Snapshot.withMutableSnapshot "
+                     "(`%s`) — the batch must land atomically; this function runs on "
+                     "Dispatchers.IO on the boot path"
+                     % masked[stray.start():stray.start() + 60].strip())
 
     # --- arm 2: autoDetectOnceIfNeeded keeps applyMirror off the main thread ---
     detect = fn_body(src, "fun autoDetectOnceIfNeeded(")
@@ -306,6 +439,18 @@ def check(root: Path) -> None:
         for mb in main_blocks(detect):
             if "applyMirror(" in mb:
                 fail(REL_SCREEN, "autoDetectOnceIfNeeded calls applyMirror inside withContext(Dispatchers.Main) — disk IO on the main thread")
+        # [wide-1024 arm 2] "called" is not "applied": `if (false) { for (…)
+        # applyMirror(…) }` keeps the token and drops the write, so the fastest
+        # mirror is selected in memory and never lands in
+        # /etc/apk/repositories. Every call site must be reachable.
+        for m in re.finditer(r"\bapplyMirror\s*\(", detect):
+            dead = dead_context(detect, m.start())
+            if dead:
+                fail(REL_SCREEN,
+                     "autoDetectOnceIfNeeded calls applyMirror under a constant-false "
+                     "construct (`%s`) — the auto-selected mirror is never written to the "
+                     "container config" % dead[:60])
+                break
 
     # --- arm 3: speed-test auto-select writes useCustomMirror + persists + applies ---
     entry = fn_body(src, "fun runAllTests(")
@@ -349,6 +494,14 @@ def check(root: Path) -> None:
         reason = settlement_guard_ok(src, detect)
         if reason:
             fail(REL_SCREEN, f"autoDetectOnceIfNeeded: {reason} — a first-boot settlement would overwrite the mirror the user picked by hand")
+        # [wide-1024 arm 5] the prior-selection set must be the VALUE the
+        # settlement carries. `emptySet().also { selectedMirrorId.keys }` reads
+        # the selection, keeps the empty receiver, and overwrites the user's
+        # pick exactly like no guard at all.
+        value_problem = prior_selection_value_problem(detect)
+        if value_problem:
+            fail(REL_SCREEN, f"autoDetectOnceIfNeeded: {value_problem} — the 'prior selection wins' contract is not met")
+
 
         # --- arm 6: the detector owns a cancellable slot the user entry points cancel ---
         slot, local = launch_slot(detect)
@@ -378,8 +531,34 @@ def check(root: Path) -> None:
                     break
             if settlement is None:
                 fail(REL_SCREEN, "autoDetectOnceIfNeeded has no main-thread settlement block writing selectedMirrorId[...]")
-            elif not (f"{slot} !==" in settlement or f"{slot} ===" in settlement or "isActive" in settlement):
-                fail(REL_SCREEN, f"autoDetectOnceIfNeeded settles without an ownership check (`{slot} !== self` / isActive)")
+            else:
+                live = None
+                for gm in re.finditer(r"\bif\s*\(", settlement):
+                    close = match_paren(settlement, gm.end() - 1)
+                    if close < 0:
+                        continue
+                    cond = settlement[gm.end():close]
+                    if (re.search(r"\b" + re.escape(slot) + r"\b", cond)
+                            or "isActive" in cond):
+                        live = (cond.strip(), gm.start(), close)
+                        break
+                # [wide-1024 arm 7] an ownership check that can never fire is
+                # not a check: `if (slot === self && false) return@withContext`
+                # keeps every token the old arm looked for.
+                if live is None:
+                    fail(REL_SCREEN, f"autoDetectOnceIfNeeded settles without an ownership check (`{slot} !== self` / isActive)")
+                elif is_constant_false("if (" + live[0] + ")"):
+                    fail(REL_SCREEN,
+                         "autoDetectOnceIfNeeded's ownership check `if (%s)` can never fire "
+                         "(constant-false conjunct) — a superseded detector still settles over "
+                         "the mirror the user just picked" % live[0][:70])
+                else:
+                    first_write = re.search(r"selectedMirrorId\[\w+\]\s*=", settlement)
+                    if first_write and live[1] > first_write.start():
+                        fail(REL_SCREEN,
+                             "autoDetectOnceIfNeeded checks ownership AFTER it already wrote "
+                             "the settlement — the guard must run before the writes")
+
 
 
 # ---------------- selftest fixtures (minimal synthetic repo) ----------------
@@ -654,6 +833,56 @@ def selftest() -> None:
             "    @Volatile private var autoDetectJob: Job? = null",
             "    private var autoDetectJob: Job? = null", "V10"),
             ("is not a @Volatile field",))
+
+        # ---- wide-1024 witnesses -------------------------------------------
+        # W11: the transaction still contains both map names (dummy reads) but
+        # the real writes moved BELOW it, onto the background thread.
+        run("W11 (ensureLoaded writes outside the snapshot)", mutate(
+            FIXTURE_SCREEN,
+            "            Snapshot.withMutableSnapshot {\n"
+            "                for (cat in MirrorCategory.entries) {\n"
+            "                    val savedUrl = p.getString(\"mirror.selected.${cat.key}\", null)\n"
+            "                    if (savedUrl != null) selectedMirrorId[cat] = entry.id\n"
+            "                    useCustomMirror[cat] = p.getBoolean(\"mirror.useCustom.${cat.key}\", false)\n"
+            "                }\n"
+            "            }",
+            "            Snapshot.withMutableSnapshot {\n"
+            "                val cat = MirrorCategory.ALPINE\n"
+            "                val dummy = selectedMirrorId[cat] ?: useCustomMirror[cat]\n"
+            "            }\n"
+            "            for (cat in MirrorCategory.entries) {\n"
+            "                val savedUrl = p.getString(\"mirror.selected.${cat.key}\", null)\n"
+            "                if (savedUrl != null) selectedMirrorId[cat] = entry.id\n"
+            "                useCustomMirror[cat] = p.getBoolean(\"mirror.useCustom.${cat.key}\", false)\n"
+            "            }", "W11"),
+            ("outside Snapshot.withMutableSnapshot",))
+
+        # W12: the apply call survives verbatim but can never run.
+        run("W12 (applyMirror behind if (false))", mutate(
+            FIXTURE_SCREEN,
+            "            for (cat in toApply) applyMirror(context, cat)",
+            "            if (false) { for (cat in toApply) applyMirror(context, cat) }", "W12"),
+            ("constant-false",))
+
+        # W13: the ownership check and the prior-selection set both survive as
+        # tokens and both became no-ops (`&& false`, `emptySet().also { … }`).
+        run("W13 (guard negated + empty prior set)", mutate(
+            FIXTURE_SCREEN,
+            "                if (autoDetectJob !== self) return@withContext\n"
+            "                val alreadySelected = selectedMirrorId.keys.toSet()",
+            "                if (autoDetectJob === self && false) return@withContext\n"
+            "                val alreadySelected = emptySet<MirrorCategory>().also { selectedMirrorId.keys }",
+            "W13"),
+            ("constant-false conjunct", "prior selection"))
+
+        # W14: an equivalent, differently spelled live guard must stay GREEN —
+        # the arm grades "can the check fire", not one spelling of it.
+        run("W14 (live guard spelled via isActive)", mutate(
+            FIXTURE_SCREEN,
+            "                if (autoDetectJob !== self) return@withContext",
+            "                if (!self.isActive) return@withContext", "W14"),
+            ())
+
 
     if not ok:
         sys.exit("MIRROR_VM_THREAD_SELFTEST=FAIL")

@@ -30,28 +30,70 @@ import sys
 SRM_REL = "src/android/app/src/main/java/com/rikkaminis/app/speech/SpeechRecognitionManager.kt"
 
 def strip_comments(src):
-    src = re.sub(r"/\*.*?\*/", "", src, flags=re.S)
-    out = []
-    for line in src.split("\n"):
-        cut = None
-        in_str = False
-        i = 0
-        while i < len(line):
-            ch = line[i]
-            if in_str:
-                if ch == "\\":
-                    i += 2
+    """Blank comments and string/char literal CONTENTS, offsets preserved.
+
+    Literal-aware: strings are scanned BEFORE comments, so a `"https://…"` or a
+    `"video/*"` literal can neither be cut as a comment nor open a block comment
+    that would blank the rest of the file (the failure mode that once hid 67
+    lines of a handler from a sibling gate).
+    """
+    out = list(src)
+    i, n = 0, len(src)
+    while i < n:
+        c = src[i]
+        if c == '"':
+            if src.startswith('"""', i):
+                j = i + 3
+                while j < n and not src.startswith('"""', j):
+                    if src[j] != "\n":
+                        out[j] = " "
+                    j += 1
+                i = j + 3
+                continue
+            j = i + 1
+            while j < n:
+                if src[j] == "\\":
+                    out[j] = " "
+                    if j + 1 < n and src[j + 1] != "\n":
+                        out[j + 1] = " "
+                    j += 2
                     continue
-                if ch == '"':
-                    in_str = False
-            elif ch == '"':
-                in_str = True
-            elif ch == "/" and i + 1 < len(line) and line[i + 1] == "/":
-                cut = i
-                break
+                if src[j] == '"':
+                    break
+                if src[j] != "\n":
+                    out[j] = " "
+                j += 1
+            i = j + 1
+            continue
+        if c == "'":
+            m = re.match(r"'(?:\\.|[^'\\\n])'", src[i:])
+            if m:
+                for k in range(i, i + m.end()):
+                    out[k] = " "
+                i += m.end()
+                continue
             i += 1
-        out.append(line if cut is None else line[:cut])
-    return "\n".join(out)
+            continue
+        if c == "/" and i + 1 < n and src[i + 1] == "/":
+            j = i
+            while j < n and src[j] != "\n":
+                out[j] = " "
+                j += 1
+            i = j
+            continue
+        if c == "/" and i + 1 < n and src[i + 1] == "*":
+            j = i
+            while j < n and not (src[j] == "*" and j + 1 < n and src[j + 1] == "/"):
+                if src[j] != "\n":
+                    out[j] = " "
+                j += 1
+            for k in range(j, min(j + 2, n)):
+                if src[k] != "\n":
+                    out[k] = " "
+            i = j + 2
+            continue
+        i += 1
+    return "".join(out)
 
 def balanced_block(src, anchor):
     i = src.find(anchor)
@@ -73,9 +115,47 @@ def balanced_block(src, anchor):
 ELVIS_STOP = "(activeEngine ?: currentEngine())?.stop()"
 ELVIS_CANCEL = "(activeEngine ?: currentEngine())?.cancel()"
 
+
+def cancel_before_clear(name, body):
+    """Order check: a function that tears down an in-flight session must cancel
+    BEFORE it clears the binding — `activeEngine = null` first makes the cancel
+    land on currentEngine() (or on a null), never on the engine that owns the mic
+    (wide-1024 witnesses arm2/arm3/arm4)."""
+    cancel_at = body.find(".cancel()")
+    clear_at = body.find("activeEngine = null")
+    if cancel_at < 0 or clear_at < 0:
+        return None
+    if clear_at < cancel_at:
+        return ("SpeechRecognitionManager.kt: %s clears activeEngine BEFORE cancelling — "
+                "the cancel() call then lands on currentEngine() (or on a null) instead of "
+                "the engine that owns the mic; cancel first, clear after" % name)
+    return None
+
 def check_manager(src):
     v = []
     code = strip_comments(src)
+
+    # arm 0 — startRecording must BIND the started instance (wide-1024 W1:
+    # deleting `activeEngine = engine` left all five consumer arms green while
+    # the latch stayed null forever)
+    start_body = balanced_block(code, "fun startRecording")
+    if start_body is None:
+        v.append("SpeechRecognitionManager.kt: startRecording declaration not found "
+                 "(gate anchors moved — deliberate edit required)")
+        return v
+    binds = [(m.start(), m.group(1))
+             for m in re.finditer(r"activeEngine\s*=\s*([A-Za-z_]\w*)", start_body)
+             if m.group(1) != "null"]
+    start_calls = [(m.start(), m.group(1))
+                   for m in re.finditer(r"([A-Za-z_]\w*)\.start\s*\(", start_body)]
+    if not start_calls:
+        v.append("SpeechRecognitionManager.kt: startRecording no longer starts an engine "
+                 "(no `<engine>.start(…)` call — the mic never opens)")
+    elif not any(x == var and p < sp for p, x in binds for sp, var in start_calls):
+        v.append("SpeechRecognitionManager.kt: startRecording does not bind activeEngine to "
+                 "the engine it starts (`activeEngine = <engine>` before `<engine>.start(…)`) — "
+                 "the latch stays null forever and every consumer degrades to currentEngine() "
+                 "(da1021 ISSUE-08: the real engine leaks on a mid-session switch)")
 
     # arm 1 — stopRecording must target the bound instance
     stop = balanced_block(code, "fun stopRecording")
@@ -105,6 +185,9 @@ def check_manager(src):
     if "activeEngine = null" not in cancel:
         v.append("SpeechRecognitionManager.kt: cancelRecording no longer clears "
                  "activeEngine (stale binding survives into the next session)")
+    w = cancel_before_clear("cancelRecording", cancel)
+    if w:
+        v.append(w)
 
     # arm 3 — selectEngine must tear down an in-flight session
     sel = balanced_block(code, "fun selectEngine")
@@ -123,6 +206,19 @@ def check_manager(src):
     if "_state.value = RecognitionState.IDLE" not in sel:
         v.append("SpeechRecognitionManager.kt: selectEngine no longer resets the "
                  "state machine to IDLE (FINISHING/RECORDING wedge)")
+    w = cancel_before_clear("selectEngine", sel)
+    if w:
+        v.append(w)
+
+    # arm 3b — selectLocale restarts mid-recording too: same cancel-then-clear
+    # order (wide-1024 W2 also_blinds arm4 — same family, same shared rule)
+    loc = balanced_block(code, "fun selectLocale")
+    if loc is None:
+        v.append("SpeechRecognitionManager.kt: selectLocale declaration not found")
+    elif ".cancel()" in loc and "activeEngine = null" in loc:
+        w = cancel_before_clear("selectLocale", loc)
+        if w:
+            v.append(w)
 
     # arm 4 — terminal callbacks must clear the binding (anti-悬留)
     fin = balanced_block(code, "override fun onFinal")
@@ -194,6 +290,19 @@ class SpeechRecognitionManager {
 
     @Volatile
     private var activeEngine: SpeechRecognitionEngine? = null
+
+    fun selectLocale(locale: Locale) {
+        _locale.value = locale
+        if (_state.value == RecognitionState.RECORDING || _state.value == RecognitionState.STARTING) {
+            val cb = activeCallbacks
+            if (cb != null) {
+                (activeEngine ?: currentEngine())?.cancel()
+                activeEngine = null
+                _state.value = RecognitionState.IDLE
+                startRecording(cb.first, cb.second)
+            }
+        }
+    }
 
     fun startRecording(a: Int, b: Int) {
         val engine = currentEngine()
@@ -267,6 +376,38 @@ BAD_CLEAR = GOOD.replace(
 # M4: binding dropped back to a plain field (no @Volatile)
 BAD_VOLATILE = GOOD.replace("@Volatile\n    private var activeEngine", "private var activeEngine")
 
+# ── wide-1024 witnesses ─────────────────────────────────────────────────────
+# W1: the write half of the latch deleted — every consumer arm stays "wired"
+# while `activeEngine` is permanently null.
+BAD_NO_BIND = GOOD.replace(
+    """        activeCallbacks = a to b
+        activeEngine = engine""",
+    """        activeCallbacks = a to b""")
+
+# W2: cancelRecording clears the binding BEFORE cancelling it.
+BAD_CANCEL_ORDER = GOOD.replace(
+    """    fun cancelRecording() {
+        (activeEngine ?: currentEngine())?.cancel()
+        activeEngine = null""",
+    """    fun cancelRecording() {
+        activeEngine = null
+        (activeEngine ?: currentEngine())?.cancel()""")
+
+# W3: selectEngine clears the binding BEFORE the teardown cancel.
+BAD_SELECT_ORDER = GOOD.replace(
+    """        if (_state.value != RecognitionState.IDLE) {
+            activeEngine?.cancel()
+            activeEngine = null
+            _state.value = RecognitionState.IDLE
+        }
+        _selectedEngineId.value = id""",
+    """        if (_state.value != RecognitionState.IDLE) {
+            activeEngine = null
+            activeEngine?.cancel()
+            _state.value = RecognitionState.IDLE
+        }
+        _selectedEngineId.value = id""")
+
 def selftest():
     failures = []
     if check_manager(GOOD):
@@ -276,24 +417,22 @@ def selftest():
         ("M2 selectEngine teardown removed", BAD_SELECT, "selectEngine"),
         ("M3 terminal clears removed", BAD_CLEAR, "onFinal"),
         ("M4 volatile dropped", BAD_VOLATILE, "@Volatile"),
+        ("W1 startRecording binding deleted", BAD_NO_BIND, "does not bind activeEngine"),
+        ("W2 cancelRecording clears before cancel", BAD_CANCEL_ORDER, "cancelRecording clears"),
+        ("W3 selectEngine clears before cancel", BAD_SELECT_ORDER, "selectEngine clears"),
     ]:
         v = check_manager(bad)
         if not v:
             failures.append("%s: gate stayed GREEN on a violation (expected %s)" % (name, expect))
-        elif expect == "stopRecording" and "elvis" not in v[0]:
-            failures.append("%s: first violation is not the stopRecording one: %s" % (name, v[0]))
-        elif expect == "selectEngine" and "selectEngine" not in v[0]:
-            failures.append("%s: first violation is not the selectEngine one: %s" % (name, v[0]))
-        elif expect == "onFinal" and "onFinal" not in v[0]:
-            failures.append("%s: first violation is not the onFinal one: %s" % (name, v[0]))
-        elif expect == "@Volatile" and "@Volatile" not in v[0]:
-            failures.append("%s: first violation is not the volatile one: %s" % (name, v[0]))
+        elif expect not in v[0]:
+            failures.append("%s: first violation is not the expected one (%s): %s"
+                            % (name, expect, v[0]))
     if failures:
         print("FAIL speech_active_engine_check --selftest")
         for x in failures:
             print("  " + x)
         return 1
-    print("SPEECH_ACTIVE_ENGINE_SELFTEST=PASS (5 fixtures: 1 clean + 4 violations)")
+    print("SPEECH_ACTIVE_ENGINE_SELFTEST=PASS (8 fixtures: 1 clean + 7 violations)")
     return 0
 
 if __name__ == "__main__":

@@ -132,8 +132,136 @@ def read(rel, root):
         return f.read()
 
 
-def missing_keys(required, body):
-    return [k for k in sorted(required) if '"%s"' % k not in body]
+def write_values(body, key):
+    """The value expression of every `put("<key>", <expr>)` call in body.
+
+    [wide-1024 12-misc-b] The old parity test was "does the literal appear
+    anywhere in the converter body". Reading the source key (`inst.optString(
+    "customUserAgent", "")`) keeps that literal present while writing NOTHING,
+    so the whole field evaporated and the gate stayed green. A write is a call,
+    so the criterion now reads the call and its argument.
+    """
+    out = []
+    for m in re.finditer(r'put\(\s*"%s"\s*,' % re.escape(key), body):
+        depth = 0
+        j = m.end()
+        while j < len(body):
+            c = body[j]
+            if c in "([{":
+                depth += 1
+            elif c in ")]}":
+                if depth == 0:
+                    break
+                depth -= 1
+            elif c == "," and depth == 0:
+                break
+            elif c == "\n" and depth == 0:
+                break
+            j += 1
+        out.append(body[m.end(): j].strip())
+    return out
+
+def is_bare_literal(expr):
+    return bool(re.match(
+        r'^(?:true|false|null|-?\d+(?:\.\d+)?|"(?:[^"\\]|\\.)*")$', expr.strip()))
+
+def guarded_by_self(body, pos, key):
+    """True when the statement that contains pos tests `"<key>"` itself —
+    the only shape in which writing a constant is not a dropped field
+    (`if (inst.optBoolean("useResponsesAPI", false)) obj.put("useResponsesAPI", true)`)."""
+    depth = 0
+    i = pos - 1
+    limit = max(0, pos - 300)
+    while i >= limit:
+        c = body[i]
+        if c in ")]":
+            depth += 1
+        elif c in "([":
+            depth -= 1
+        elif depth == 0 and c in ";\n{}":
+            return '"%s"' % key in body[i + 1: pos]
+        i -= 1
+    return False
+
+def guard_condition(body, pos):
+    """Condition of the `if (…)` that guards pos.
+
+    Two shapes: a same-line / statement prefix (`if (c) obj.put(…)`) and an
+    enclosing block header (`if (c) { … put(…) … }`). The first walk must not
+    stop at the statement's own newline while looking for the second.
+    """
+    depth = 0
+    i = pos - 1
+    while i >= 0 and pos - i < 400:
+        c = body[i]
+        if c in ")]":
+            depth += 1
+        elif c in "([":
+            depth -= 1
+        elif depth == 0 and c in ";\n{}":
+            break
+        i -= 1
+    m = re.search(r"if\s*\(([\s\S]*)\)\s*[\w.\[\]]*$", body[i + 1: pos])
+    if m:
+        return m.group(1)
+    depth = 0
+    i = pos - 1
+    while i >= 0 and pos - i < 800:
+        c = body[i]
+        if c in "}]":
+            depth += 1
+        elif c in "[{":
+            if depth > 0:
+                depth -= 1
+            else:
+                hdr = body[max(0, i - 300): i]
+                m = re.search(r"if\s*\(([\s\S]*)\)\s*$", hdr)
+                return m.group(1) if m else ""
+        i -= 1
+    return ""
+
+def identifier_written_keys(body):
+    """Keys written through a VARIABLE whose value set is a literal allow-list in
+    the same body — the wholesale-copy shape
+    (`for (k in arrayOf("a","b")) { …put(k, …) }`).
+
+    Without this the write test would be spelling-dependent in the other
+    direction: a converter that copies a sub-object field-by-field through one
+    loop writes every key correctly and never spells `put("maxThinkingLevel"`.
+    """
+    out = set()
+    for m in re.finditer(r"put\(\s*([A-Za-z_]\w*)\s*,", body):
+        var = m.group(1)
+        for lm in re.finditer(
+                r"for\s*\(\s*%s\s+in\s+(?:arrayOf|listOf|setOf)\s*\(([^)]*)\)"
+                % re.escape(var), body):
+            out |= set(re.findall(r'"([A-Za-z_]\w*)"', lm.group(1)))
+    return out
+
+def missing_writes(required, body):
+    """Keys the converter READS but never WRITES — the field-evap shape.
+
+    A write whose value is a bare literal is only accepted when the statement
+    itself tests the key (a polarity write: `if (has(k)) put(k, false)`); any
+    other constant writes a value that has nothing to do with the source.
+    """
+    gone = []
+    for k in sorted(required):
+        vals = write_values(body, k)
+        if not vals:
+            if k in identifier_written_keys(body):
+                continue
+            gone.append(k)
+            continue
+        if all(is_bare_literal(v) for v in vals):
+            pos = None
+            for m in re.finditer(r'put\(\s*"%s"\s*,' % re.escape(k), body):
+                if is_bare_literal(body[m.end(): m.end() + 80].split(")")[0].strip()):
+                    pos = m.start()
+                    break
+            if pos is None or not guarded_by_self(body, pos, k):
+                gone.append(k + " (constant value)")
+    return gone
 
 
 def rcf_const_table(pr_src):
@@ -204,6 +332,19 @@ def run(root):
             "arm1: default-false read on a default-true field "
             "(optBoolean(\"appendV1Suffix\", false)) — explicit false would be "
             "dropped and re-imported as true")
+    # [wide-1024 12-misc-b] The 3-state passthrough also has to be UNCONDITIONAL
+    # on the value: `if (has(k) && optBoolean(k)) { put(k, optBoolean(k)) }` keeps
+    # the guard, the write and the round-trip, and skips the write for an explicit
+    # `false` — the importer's default-true then flips it back to true. Judge the
+    # guarding condition, not the spelling of the call.
+    for m in re.finditer(r'put\(\s*"appendV1Suffix"\s*,', conv_code):
+        cond = guard_condition(conv_code, m.start())
+        if re.search(r'optBoolean\s*\(\s*"appendV1Suffix"', cond):
+            problems.append(
+                "arm1: the passthrough write is guarded by the VALUE "
+                "(optBoolean(\"appendV1Suffix\") in the `if`) — an explicit false is "
+                "skipped, the key goes missing and the importer re-imports it as true")
+            break
 
     # Arm 2 — provider/model key parity (derived from the Android export).
     # [deep-audit-1039 A-07] exportInstanceJSON delegates the run-config keys to
@@ -227,14 +368,14 @@ def run(root):
             "five run-config keys would stop being exported (converter keeps "
             "them for old backups, so parity alone cannot see the drop)")
     provider_keys = (set(PUT_KEY.findall(exp)) | run_config_keys) - set(PROVIDER_EXEMPT)
-    gone = missing_keys(provider_keys, conv_code)
+    gone = missing_writes(provider_keys, conv_code)
     if gone:
         problems.append("arm2: convertProviders dropped export key(s): %s"
                         % ", ".join(gone))
 
     # Arm 3 — chat-session key parity (derived from ConfigBackup's export block).
     session_keys = set(PUT_KEY.findall(sess)) - set(SESSION_EXEMPT)
-    gone_s = missing_keys(session_keys, chat_code)
+    gone_s = missing_writes(session_keys, chat_code)
     if gone_s:
         problems.append("arm3: convertChats dropped session export key(s): %s"
                         % ", ".join(gone_s))
@@ -243,7 +384,7 @@ def run(root):
     # ConfigBackup's modelGroups block; the OpenMinis side reads the same
     # provider_config.json shape, so the two key sets must agree.
     group_keys = set(PUT_KEY.findall(grp)) - set(GROUP_EXEMPT)
-    gone_g = missing_keys(group_keys, groups_code)
+    gone_g = missing_writes(group_keys, groups_code)
     if gone_g:
         problems.append("arm4: convertGroups dropped modelGroups export key(s): %s"
                         % ", ".join(gone_g))
@@ -538,6 +679,26 @@ def selftest():
     arm("appendV1Suffix single-state", FIX_CONV_BAD_V1, FIX_CHAT_OK, True)
     arm("provider key dropped", FIX_CONV_BAD_KEY, FIX_CHAT_OK, True)
     arm("session key dropped", FIX_CONV_OK, FIX_CHAT_BAD, True)
+    # ── [wide-1024 12-misc-b] witness arms ────────────────────────────────
+    # Every token the old literal-presence test looked for is still present; only
+    # the EFFECT is gone, so each arm asserts the write/carry criterion speaks.
+    arm("appendV1Suffix write guarded by its value",
+        FIX_CONV_OK.replace(
+            'if (inst.has("appendV1Suffix")) {',
+            'if (inst.has("appendV1Suffix") && inst.optBoolean("appendV1Suffix")) {'),
+        FIX_CHAT_OK, True, needle="arm1")
+    arm("provider key read but never written",
+        FIX_CONV_OK.replace(
+            '    obj.put("label", inst.optString("label", ""))\n',
+            '    inst.optString("label", "")\n'),
+        FIX_CHAT_OK, True, needle="arm2: convertProviders dropped")
+    arm("session key parsed but never written",
+        FIX_CONV_OK,
+        FIX_CHAT_OK.replace(
+            '        isoToMillis(pinnedRaw)?.takeIf { it > 0 }?.let { o.put("pinnedAt", it) }\n',
+            ''),
+        True, needle="arm3: convertChats dropped")
+
     # [deep-audit-1039 A-07] delegated-key arms. The delegation is what makes the
     # arm see the run-config keys at all; removing it is the pre-fix blind shape
     # (literal extraction finds only the two direct puts and silently drops five).

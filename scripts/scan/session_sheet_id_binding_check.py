@@ -320,6 +320,51 @@ def _write_is_guarded(code, idx, map_var):
             return True
     return False
 
+def _judge_merge_live_ids(body, value, label, findings):
+    """wide-1024 (dataflow): the merge must receive the LIVE id list.
+
+    `liveIds = emptyList()` is the shape that walks nothing while looking
+    exactly like the intended call: every stored seed is dropped and all
+    session toggles render off. Anchored on the value, not on the call.
+    """
+    norm = re.sub(r"\s+", "", value)
+    if EMPTY_LITERAL_RE.match(norm):
+        findings.append(
+            f"{label}: the merge helper is handed `liveIds = {value}` — an empty id "
+            f"list walks nothing, so the whole per-session seed set is discarded and "
+            f"every toggle in the sheet renders off (the call looks right, the "
+            f"argument is the wrong value)"
+        )
+        return
+    if not re.fullmatch(r"[A-Za-z_]\w*", norm):
+        return  # an inline expression derived from the live list -- not a literal
+    if not re.search(r"\b(?:val|var)\s+" + re.escape(norm) + r"\s*=", body):
+        findings.append(
+            f"{label}: the merge helper is handed `liveIds = {value}`, a value this "
+            f"effect never computes — the id list has to come from the live list"
+        )
+        return
+    if len(re.findall(r"\b" + re.escape(norm) + r"\b", body)) < 2:
+        findings.append(
+            f"{label}: `{value}` is computed inside the effect and then discarded — "
+            f"it never feeds the seed read, so the merge walks ids that were never "
+            f"queried"
+        )
+
+
+def _judge_seed_read_args(body, label, findings):
+    """wide-1024 (dataflow): the per-session read must use the sheet's own id."""
+    for _, args in _effect_blocks_handoff(body, r"\bisEnabledForSession\s*\("):
+        value = args[-1][1]
+        if not re.search(r"\b" + SESSION_ID_TOKEN + r"\b", value):
+            findings.append(
+                f"{label}: the seeding read calls `isEnabledForSession(…, {value})` "
+                f"instead of the sheet's own `{SESSION_ID_TOKEN}` — every lookup "
+                f"lands on the orphan `__new__` row, so the real session's toggles "
+                f"never come back"
+            )
+
+
 def check_seeding_guard(code, label, findings):
     """[da1045-B6] Shared by BOTH sheets: seed writes must survive a re-check.
 
@@ -350,6 +395,14 @@ def check_seeding_guard(code, label, findings):
                     and bool(re.search(r"\b" + re.escape(map_var) + r"\b",
                                        code[call_open:call_close + 1]))
                 )
+                # ... and the live id list it walks must be the real one
+                args = _call_args(code, call_open)
+                if args:
+                    named = dict((n, v) for n, v in args if n)
+                    live_ids = named.get("liveIds", args[0][1] if args[0][0] is None else None)
+                    if live_ids is not None:
+                        _judge_merge_live_ids(body, live_ids, label, findings)
+            _judge_seed_read_args(body, label, findings)
             if not writes and not helper_ok:
                 findings.append(
                     f"{label}: the seeding effect no longer writes `{map_var}` and does "
@@ -401,6 +454,103 @@ TITLE_KEYLESS_RE = r"\bvar\s+title\s+by\s+remember\s*\{"
 CATEGORY_KEYED_RE = r"\bvar\s+selectedCategory\s+by\s+remember\s*\([^)]*\bsession\.id\b"
 CATEGORY_KEYLESS_RE = r"\bvar\s+selectedCategory\s+by\s+remember\s*\{"
 LIVE_SEED_EFFECT_RE = r"LaunchedEffect\s*\([^)]*\bliveSession\.id\b"
+
+# wide-1024 (dataflow axis): the sheet name it sits in is the id every
+# per-session read must use. The gate already pins this token at the effect
+# keys / the call sites, so the seed READ is judged against the same name.
+SESSION_ID_TOKEN = "sessionId"
+
+EMPTY_LITERAL_RE = re.compile(
+    r"^(?:emptyList|emptySet|emptySequence|listOf|setOf|mutableListOf|"
+    r"mutableSetOf|arrayListOf|sequenceOf)\s*(?:<[^>]*>)?\s*\(\s*\)$"
+)
+
+
+def _call_args(code, open_paren):
+    """[(name_or_None, value_text)] for the call whose `(` is at open_paren.
+
+    Brackets are matched (not `[^,]*` split) so nested calls / lambdas inside an
+    argument do not truncate it. Returns [] when the call does not close.
+    """
+    close = _match_forward(code, open_paren, "(", ")")
+    if close < 0:
+        return []
+    out, depth, start, i = [], 0, open_paren + 1, open_paren + 1
+    while i < close:
+        c = code[i]
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+        elif c == "," and depth == 0:
+            out.append(code[start:i])
+            start = i + 1
+        i += 1
+    out.append(code[start:close])
+    args = []
+    for raw in out:
+        arg = raw.strip()
+        if not arg:
+            continue
+        named = re.match(r"^([A-Za-z_]\w*)\s*=(?!=)\s*(.*)$", arg, re.S)
+        if named:
+            args.append((named.group(1), named.group(2).strip()))
+        else:
+            args.append((None, arg))
+    return args
+
+
+def _effect_blocks_handoff(body, call_re):
+    """Yield (call_start, args) for every `call_re` match inside `body`."""
+    for m in re.finditer(call_re, body):
+        open_paren = m.end() - 1
+        args = _call_args(body, open_paren)
+        if args:
+            yield m.start(), args
+
+
+def _mirrors_state(block, state, source):
+    """True when the effect body feeds `source` into the local `state` state.
+
+    Three accepted spellings: direct assignment, a scope-function mirror
+    (`liveSession.title?.let { title = it }`), and a one-hop local binding.
+    Anchoring the DECISION ("the fresh value reaches the state") rather than
+    the spelling is the point: the gate used to accept an effect whose body
+    had been emptied of the mirror while the keys stayed correct.
+    """
+    src = re.escape(source)
+    st = re.escape(state)
+    if re.search(r"\b" + st + r"\s*=(?!=)[^;\n]*" + src, block):
+        return True
+    if re.search(
+        src + r"\s*\?*\s*\.\s*(?:let|also|run|apply|takeIf)\s*\{[^{}]*\b"
+        + st + r"\s*=(?!=)",
+        block,
+    ):
+        return True
+    local = re.search(r"\bva[lr]\s+(\w+)\s*=\s*" + src + r"\b", block)
+    if local and re.search(r"\b" + st + r"\s*=\s*" + re.escape(local.group(1)) + r"\b",
+                           block):
+        return True
+    return False
+
+
+def _live_seed_effect_block(body):
+    """Body of the first `LaunchedEffect(<keys with liveSession.id>) { … }`."""
+    for m in re.finditer(r"\bLaunchedEffect\s*\(", body):
+        close_paren = _match_forward(body, m.end() - 1, "(", ")")
+        if close_paren < 0:
+            continue
+        if not re.search(r"\bliveSession\.id\b", body[m.end():close_paren]):
+            continue
+        open_brace = body.find("{", close_paren)
+        if open_brace < 0:
+            continue
+        close_brace = _match_forward(body, open_brace, "{", "}")
+        if close_brace < 0:
+            return None  # unbalanced effect body -> caller fails closed
+        return body[open_brace:close_brace + 1]
+    return None
 
 
 def check_chatscreen(code, findings):
@@ -488,6 +638,25 @@ def check_sessions_shared(code, findings):
             "(expected `LaunchedEffect(liveSession.id, …)`) — otherwise a re-pointed sheet "
             "never re-seeds from the new row"
         )
+    else:
+        # wide-1024 (dataflow): correct keys are only half the contract — the
+        # effect has to actually mirror the fresh row into the edit state.
+        effect = _live_seed_effect_block(body)
+        if effect is None:
+            findings.append(
+                "SessionsShared.kt: the liveSession-keyed seeding effect body could not be "
+                "parsed (fail-closed) — re-point this guard"
+            )
+        else:
+            for state, source in (("title", "liveSession.title"),
+                                  ("selectedCategory", "liveSession.category")):
+                if not _mirrors_state(effect, state, source):
+                    findings.append(
+                        f"SessionsShared.kt: the liveSession-keyed effect no longer mirrors "
+                        f"`{source}` into `{state}` — the effect fires on regeneration but the "
+                        f"field keeps the text it was opened with, and Save writes the stale "
+                        f"value back over the freshly generated one"
+                    )
     return findings
 
 
@@ -968,6 +1137,24 @@ internal fun SessionEditSheet(
 """
 
 
+# ── wide-1024 witnesses: the three shapes that defeated this gate ──────────
+# (each is the find→replace from the wide-sweep report, replayed verbatim)
+FIX_SKILLS_EMPTY_LIVE_IDS = FIX_SKILLS_OK.replace(
+    "            liveIds = skills.map { it.id },",
+    "            liveIds = emptyList(),",
+)
+FIX_MCPS_NEW_SESSION_READ = FIX_MCPS_MERGE.replace(
+    "mcpRepository.isEnabledForSession(it, sessionId)",
+    'mcpRepository.isEnabledForSession(it, "__new__")',
+)
+FIX_SESSIONS_TITLE_MIRROR_DROPPED = FIX_SESSIONS_OK.replace(
+    "        liveSession.title?.let { title = it }\n", "")
+# clean counter-arm: a different legal spelling of the same mirror
+FIX_SESSIONS_DIRECT_MIRROR = FIX_SESSIONS_OK.replace(
+    "        liveSession.title?.let { title = it }",
+    "        title = liveSession.title ?: title")
+
+
 def make_tree(chatscreen, skills, mcps, sessions=FIX_SESSIONS_OK):
     root = tempfile.mkdtemp(prefix="ssib-selftest-")
     base = "src/android/app/src/main/java/com/rikkaminis/app/ui/chat"
@@ -1160,6 +1347,36 @@ def selftest():
         print(f"[selftest ok] precision: all 5 anchors flagged ({len(findings)} findings)")
     finally:
         shutil.rmtree(root, ignore_errors=True)
+
+    # ── wide-1024 witnesses: exactly one finding each, naming its own anchor ──
+    for name, sk, mp, ss, must_mention, want_count in (
+        ("W5 skills merge handed an empty id list", FIX_SKILLS_EMPTY_LIVE_IDS,
+         FIX_MCPS_OK, FIX_SESSIONS_OK, ["SessionSkillsSheet.kt", "empty id list"], 1),
+        ("W6 mcps seed read queries __new__", FIX_SKILLS_OK,
+         FIX_MCPS_NEW_SESSION_READ, FIX_SESSIONS_OK,
+         ["SessionMcpsSheet.kt", "__new__", "isEnabledForSession"], 1),
+        ("W4 edit-sheet effect drops the title mirror", FIX_SKILLS_OK,
+         FIX_MCPS_OK, FIX_SESSIONS_TITLE_MIRROR_DROPPED,
+         ["SessionsShared.kt", "liveSession.title"], 1),
+        ("W4ok direct title mirror stays clean", FIX_SKILLS_OK,
+         FIX_MCPS_OK, FIX_SESSIONS_DIRECT_MIRROR, [], 0),
+    ):
+        root = make_tree(FIX_CHATSCEEN_OK, sk, mp, ss)
+        try:
+            findings = check(root)
+            joined = " | ".join(findings)
+            for hit in must_mention:
+                if hit not in joined:
+                    ok = False
+                    print(f"[selftest FAIL] wide {name}: missing `{hit}` in findings")
+            if len(findings) != want_count:
+                ok = False
+                print(f"[selftest FAIL] wide {name}: expected {want_count} finding(s), "
+                      f"got {len(findings)}: {findings}")
+            else:
+                print(f"[selftest ok] wide {name}: exactly {want_count} finding(s)")
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
 
     print(SELFTEST_MARKER if ok else "SESSION_SHEET_ID_BINDING_SELFTEST=FAIL")
     return 0 if ok else 1

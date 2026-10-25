@@ -244,6 +244,39 @@ def scan_visible_only_read(raw):
         bad.append("the absent/bare case no longer keeps the documented default (true)")
     if "is VisibleOnlyFlag.Read.Value -> read.value" not in body:
         bad.append("a spelled boolean is no longer honoured")
+    # [wide-1024 dataflow] The flag is RESOLVED into a local; the walker is what
+    # actually consumes it. `walkNode(…, true, …)` keeps the resolve call, the
+    # three-way classifier and every other anchor intact while making
+    # `--visible-only=false` a no-op.
+    vm = re.search(
+        r"val\s+(\w+)\s*=\s*when\s*\(\s*val\s+\w+\s*=\s*VisibleOnlyFlag\.resolve\(", body
+    )
+    flag_var = vm.group(1) if vm else None
+    if flag_var is None:
+        at = body.find("VisibleOnlyFlag.resolve(")
+        if at >= 0:
+            head = body[max(0, at - 200):at]
+            names = re.findall(r"val\s+(\w+)\s*=", head)
+            flag_var = names[-1] if names else None
+    walks = call_args_of(body, "walkNode")
+    if not walks:
+        bad.append("uiDump no longer walks the tree through walkNode() — the --visible-only "
+                   "consumer cannot be read (fail-closed)")
+    elif flag_var is None:
+        bad.append("the --visible-only decision is not bound to a local any more — cannot "
+                   "tell whether the walker consumes it (fail-closed)")
+    else:
+        for _at, pargs in walks:
+            if len(pargs) < 7:
+                bad.append("walkNode() lost its (registry, node, depth, maxDepth, visibleOnly, "
+                           "compact, out) shape — re-anchor this criterion (fail-closed)")
+                break
+            passed = pargs[4].split("=")[-1].strip()
+            if passed != flag_var:
+                bad.append(f"uiDump passes `{passed}` as walkNode's visibleOnly argument while "
+                           f"the flag was resolved into `{flag_var}` — --visible-only is read "
+                           f"and then ignored, so the caller's request has no effect")
+                break
     marker = "is VisibleOnlyFlag.Read.Invalid -> "
     at = body.find(marker)
     if at < 0:
@@ -281,9 +314,27 @@ def scan_handler(raw):
     if body is None:
         bad.append("tapText() not found — the probe lost its subject")
         return bad
-    if "TapTextFlow.plan(" not in body:
+    plans = call_args_of(body, "TapTextFlow.plan")
+    if not plans:
         bad.append("tapText no longer decides through TapTextFlow.plan "
                    "(the performAction result is discarded again)")
+    for _at, pargs in plans:
+        # [wide-1024 dataflow] `TapTextFlow.plan(n.isClickable, true)` keeps the
+        # seam and throws away the only observation it was built to carry: the
+        # stage machine then reports CLICKED for a node that refused the click.
+        if len(pargs) < 2:
+            bad.append("TapTextFlow.plan() lost its (isClickable, selfClickSucceeded) shape — "
+                       "cannot tell whether the click outcome is observed (fail-closed)")
+        elif "performAction(" not in pargs[1]:
+            bad.append(f"tapText feeds TapTextFlow.plan() a FABRICATED self-click outcome "
+                       f"(`{pargs[1][:40]}`) — the ACTION_CLICK result must be the value the "
+                       f"stage machine consumes, not an assumed `true`")
+    for m in re.finditer(r"\bperformAction\s*\(", body):
+        line_start = body.rfind("\n", 0, m.start()) + 1
+        prefix = body[line_start:m.start()].strip()
+        if prefix == "" or re.fullmatch(r"(?:else|try|\}|\{)", prefix):
+            bad.append("tapText performs ACTION_CLICK as a bare statement — its Boolean return "
+                       "is discarded, so a refused click is indistinguishable from a landed one")
     if "TapTextFlow.fallbackSucceeded(" not in body:
         bad.append("tapText no longer reads the coordinate tap's own outcome")
     if 'err(args, "ACTION_FAILED"' not in body:
@@ -291,6 +342,60 @@ def scan_handler(raw):
     if "if (n.isClickable) n.performAction(" in body:
         bad.append("tapText discards performAction()'s return value again")
     return bad
+
+
+def call_args_of(text, name):
+    """[(offset, [top-level argument texts])] for every `name(...)` call.
+
+    Paren-balanced with string-aware scanning already applied by code_only, so
+    a nested call (`n.performAction(ACTION_CLICK)`) stays ONE argument instead
+    of being cut at its own `)`."""
+    out = []
+    for m in re.finditer(re.escape(name) + r"\s*\(", text):
+        i = text.index("(", m.end() - 1)
+        depth = 0
+        for k in range(i, len(text)):
+            ch = text[k]
+            if ch in "([{":
+                depth += 1
+            elif ch in ")]}":
+                depth -= 1
+                if depth == 0:
+                    out.append((m.start(), split_top_level(text[i + 1:k])))
+                    break
+    return out
+
+
+def split_top_level(argtext):
+    """Split a call's argument text on top-level commas."""
+    parts, depth, cur = [], 0, []
+    for ch in argtext:
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        if ch == "," and depth == 0:
+            parts.append("".join(cur).strip())
+            cur = []
+        else:
+            cur.append(ch)
+    if "".join(cur).strip():
+        parts.append("".join(cur).strip())
+    return parts
+
+
+def literal_decides(cond):
+    """True when a literal operand decides [cond].
+
+    [wide-1024] `if (false && promptToken != token) return null` mentions the
+    token comparison and still contains the early return, so a substring
+    criterion cannot tell it from the real guard — but the comparison can never
+    reject a late teardown."""
+    for part in re.split(r"&&|\|\|", cond):
+        t = part.strip().strip("()").strip()
+        if t in ("true", "false", "!true", "!false"):
+            return True
+    return False
 
 
 def member_body(text, signature):
@@ -461,6 +566,16 @@ def release_guard_gaps(text):
             bad.append(f"the slot release (`{SLOT_RELEASE}`, line {i + 1}) is not "
                        "ownership-guarded — a late teardown can dismiss the prompt a NEWER "
                        "waiter is showing")
+            continue
+        # [wide-1024 dataflow] The comparison must be able to REJECT: a literal
+        # operand (`false &&`, `|| true`, `!true`) keeps the substring and kills
+        # the guard, which is the whole generation-counter mechanism.
+        for m in re.finditer(r"if\s*\(([^\n]*promptToken[^\n]*)\)", window):
+            if literal_decides(m.group(1)):
+                bad.append(f"the slot release's ownership guard is decided by a literal "
+                           f"(`{m.group(1).strip()}`, line {i + 1}) — the token comparison can "
+                           f"never reject a late teardown, so a stale watcher clears the slot a "
+                           f"NEWER waiter owns")
     return bad
 
 
@@ -576,6 +691,9 @@ def selftest():
         "            VisibleOnlyFlag.Read.Absent -> true\n"
         "            is VisibleOnlyFlag.Read.Value -> read.value\n"
         "            is VisibleOnlyFlag.Read.Invalid -> return err(args, \"INVALID_ARGS\", \"bad ${read.raw}\", exit = 2)\n"
+        "        }\n"
+        "        for (root in svc.rootNodes()) {\n"
+        "            walkNode(svc.nodeRegistry, root, 0, depth, visibleOnly, true, arr)\n"
         "        }\n"
         "        return ok(args, JSONObject())\n"
         "    }\n"
@@ -744,6 +862,15 @@ def selftest():
             "        if (TapTextFlow.fallbackSucceeded(tapped.exitCode)) return tapped\n"
             "        return err(args, \"ACTION_FAILED\", \"no tap\")\n",
             "        return tapped\n")),
+        # ── wide-1024 witness arms (each was green before this branch) ──
+        # the seam survives, the observation it carries does not.
+        ("handler/tapText fabricates the self-click outcome", clean_handler.replace(
+            "TapTextFlow.plan(n.isClickable, n.performAction(ACTION_CLICK))",
+            "TapTextFlow.plan(n.isClickable, true)")),
+        # the flag is resolved correctly, the walker ignores it.
+        ("handler/uiDump hardcodes the walker's visibleOnly", clean_handler.replace(
+            "walkNode(svc.nodeRegistry, root, 0, depth, visibleOnly, true, arr)",
+            "walkNode(svc.nodeRegistry, root, 0, depth, true, true, arr)")),
         ("handler/discarded performAction", clean_handler.replace(
             "        if (TapTextFlow.plan(n.isClickable, n.performAction(ACTION_CLICK)) == TapTextFlow.Stage.CLICKED) {\n"
             "            return ok(args, JSONObject())\n"
@@ -816,6 +943,10 @@ def selftest():
             "                cont.invokeOnCancellation { clearSlotIfOwner(token) }\n", "")),
         ("slot/publishes without the lock", clean_slot.replace(
             "                val accepted = synchronized(slotLock) {", "                val accepted = run {")),
+        # ── wide-1024: the ownership comparison keeps its shape and loses its power ──
+        ("slot/guard short-circuited by a literal", clean_slot.replace(
+            "        if (promptToken != token) return null\n",
+            "        if (false && promptToken != token) return null\n")),
         ("slot/respond outside the lock", clean_slot.replace(
             "        val taken = synchronized(slotLock) {", "        val taken = run {")),
     ]

@@ -202,6 +202,314 @@ def call_arg_block(text, start):
         i += 1
     return None
 
+def function_spans(text_nc, text_masked, signature):
+    """(start, end) of the declaration at `signature` — end just past the '}'
+    that closes its body. Offsets are valid in BOTH texts (masking is
+    length-preserving), so a structural walk on `text_masked` can be read back
+    as source on `text_nc`."""
+    idx = text_nc.find(signature)
+    if idx < 0:
+        return None
+    ob = text_masked.find("{", idx)
+    if ob < 0:
+        return None
+    depth = 0
+    for i in range(ob, len(text_masked)):
+        if text_masked[i] == "{":
+            depth += 1
+        elif text_masked[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return (idx, i + 1)
+    return None
+
+
+def stmt_end(text, start):
+    """Index of the newline that ENDS the statement/expression at `start`.
+
+    Bracket-depth aware, and a line ending in an operator (or a next line that
+    starts with `?:` / `.`) continues the statement — Kotlin's expression-bodied
+    helpers wrap their body across lines and a naive `find("\\n")` would slice
+    the polarity check down to its first line."""
+    depth = 0
+    i, n = start, len(text)
+    while i < n:
+        c = text[i]
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+        elif c == "\n" and depth <= 0:
+            seg = text[start:i].rstrip()
+            j = i + 1
+            while j < n and text[j] in " \t":
+                j += 1
+            if seg.endswith(("?:", "=", "&&", "||", "+", ".", ",", "(")) or \
+                    text[j:j + 3].startswith(("?:", "?.")) or text[j:j + 1] == ".":
+                i += 1
+                continue
+            return i
+        i += 1
+    return n
+
+
+def split_top_level(text, sep=","):
+    """Split on `sep` at bracket depth 0 (strings already masked)."""
+    out, buf, depth = [], [], 0
+    for c in text:
+        if c in "([{<":
+            depth += 1
+        elif c in ")]}>":
+            depth -= 1
+        if c == sep and depth <= 0:
+            out.append("".join(buf))
+            buf = []
+            continue
+        buf.append(c)
+    out.append("".join(buf))
+    return out
+
+
+def top_level_index(text, token):
+    """Index of `token` at bracket depth 0, or -1."""
+    depth = 0
+    i, n = 0, len(text)
+    while i < n:
+        c = text[i]
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+        elif depth <= 0 and text.startswith(token, i):
+            return i
+        i += 1
+    return -1
+
+
+def param_names(text_masked, sig_idx):
+    """Parameter names of the declaration at `sig_idx` (annotation/val prefixes
+    and types dropped), or [] when the parameter list cannot be parsed."""
+    op = text_masked.find("(", sig_idx)
+    if op < 0:
+        return []
+    depth = 0
+    cp = -1
+    for i in range(op, len(text_masked)):
+        if text_masked[i] == "(":
+            depth += 1
+        elif text_masked[i] == ")":
+            depth -= 1
+            if depth == 0:
+                cp = i
+                break
+    if cp < 0:
+        return []
+    inner = text_masked[op + 1:cp]
+    names = []
+    for part in split_top_level(inner):
+        part = part.strip()
+        if not part:
+            continue
+        m = re.match(r"(?:@\w+\s+)*(?:(?:val|var|noinline|crossinline)\s+)*([A-Za-z_]\w*)\s*:", part)
+        names.append(m.group(1) if m else None)
+    return names
+
+
+def check_resolve_polarity(sr_nc, sr_masked):
+    """arm1 (dataflow): resolveMergeBase's BODY must read the fresh block first.
+
+    The pre-fix criterion only checked the parameter ORDER, on the assumption
+    that "polarity lives in the signature". It does not: a body that swaps the
+    two operands (`diskContent?.ifBlank { null } ?: newFrontmatter`) keeps the
+    signature intact, silently returns the on-disk block for every skill that
+    already exists on disk, and the incoming subagent / max_turns /
+    allowed_tools block is dropped — ISSUE-05's headline defect, verbatim.
+
+    The criterion: the FIRST declared parameter is the guarded (left) operand
+    of the body's top-level elvis, the SECOND is the fallback. Anything we
+    cannot derive fail-closes (a `when`-shaped rewrite must re-point this arm)."""
+    idx = sr_nc.find(RESOLVE_DEF)
+    if idx < 0:
+        return []  # the presence arm already reports the missing declaration
+    op = sr_masked.find("(", idx)
+    if op < 0:
+        return ["arm1 resolveMergeBase: no parameter list (fail-closed)"]
+    depth = 0
+    cp = -1
+    for i in range(op, len(sr_masked)):
+        if sr_masked[i] == "(":
+            depth += 1
+        elif sr_masked[i] == ")":
+            depth -= 1
+            if depth == 0:
+                cp = i
+                break
+    if cp < 0:
+        return ["arm1 resolveMergeBase: unbalanced parameter list (fail-closed)"]
+    head_masked = sr_masked[op:cp + 1]
+    names = param_names(head_masked, 0)
+    if len(names) < 2 or not names[0] or not names[1]:
+        return ["arm1 resolveMergeBase: cannot derive its parameter names (fail-closed — "
+                "re-point this arm at the new signature)"]
+    # The expression body starts at the first `=` after the parameter list —
+    # and a `{` before it means a block body, which this arm cannot judge.
+    k, eq = cp + 1, -1
+    while k < len(sr_masked):
+        c = sr_masked[k]
+        if c == "=" and sr_masked[k + 1:k + 2] != "=" and sr_masked[k - 1:k] not in ("!", "<", ">"):
+            eq = k
+            break
+        if c in "{;" or c == "\n":
+            break
+        k += 1
+    if eq < 0:
+        return ["arm1 resolveMergeBase: no expression body to inspect (block body or a "
+                "signature split across lines — fail-closed: re-point this arm)"]
+    expr_start = eq + 1
+    expr_end = stmt_end(sr_masked, expr_start)
+    expr_masked = sr_masked[expr_start:expr_end]
+    expr = sr_nc[expr_start:expr_end]
+    elvis = top_level_index(expr_masked, "?:")
+    if elvis < 0:
+        return ["arm1 resolveMergeBase: the merge base is no longer a memory-first elvis "
+                "(`new block ?: disk`) — cannot prove the fresh block wins (fail-closed: "
+                "re-point this arm at the new shape)"]
+    left = expr[:elvis]
+    right = expr[elvis + 2:]
+    out = []
+    if names[0] not in left:
+        out.append(
+            "arm1 resolveMergeBase does not GUARD the fresh block — `%s` (the first "
+            "parameter) does not appear before the top-level `?:`, so the on-disk copy "
+            "shadows the incoming subagent / max_turns / allowed_tools block "
+            "(body reads: %s)" % (names[0], " ".join(expr.split())[:120]))
+    if names[1] not in right:
+        out.append(
+            "arm1 resolveMergeBase: the fallback side of `?:` does not read `%s` (the "
+            "disk parameter) — polarity is inverted or a third source was introduced "
+            "(body reads: %s)" % (names[1], " ".join(expr.split())[:120]))
+    return out
+
+
+MERGE_WALK_RE = re.compile(
+    r"for\s*\(\s*i\s+in\s+1\s+until\s+frontmatterEnd\s*\)\s*\{")
+
+
+def _block_at(text, open_idx):
+    depth = 0
+    for i in range(open_idx, len(text)):
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[open_idx:i + 1]
+    return None
+
+
+def check_merge_seed(sr_nc, sr_masked):
+    """arm7 (dataflow): the collected-lines list must START EMPTY.
+
+    The pre-fix criterion pinned the walk's lower bound (`1 until
+    frontmatterEnd`), i.e. it proved only that the loop skips the source's
+    opening delimiter. Seeding the list instead — `mutableListOf("---")` — puts
+    a second `---` in the emitted document, which then no longer parses as a
+    frontmatter block: every save of a skill silently corrupts its SKILL.md.
+
+    Criterion: derive the accumulator from the walk, then require its
+    initializer (and anything added before the walk) to carry no `---`."""
+    span = function_spans(sr_nc, sr_masked, "internal fun mergeFrontmatter(")
+    if span is None:
+        return []  # presence is reported by the walk arm
+    start, end = span
+    body_masked = sr_masked[start:end]
+    body = sr_nc[start:end]
+    m = MERGE_WALK_RE.search(body_masked)
+    if m is None:
+        return []  # the walk arm owns the missing/broken walk
+    loop = _block_at(body_masked, m.end() - 1) or ""
+    fm_add = re.search(r"(\w+)\s*\.\s*add\(", loop)
+    if fm_add is None:
+        return ["arm7 mergeFrontmatter: cannot derive the list the walk fills (no "
+                "`<list>.add(` inside the `1 until frontmatterEnd` loop) — fail-closed: "
+                "re-point this arm"]
+    var = fm_add.group(1)
+    d = re.search(r"\bval\s+%s\s*=\s*" % re.escape(var), body_masked)
+    if d is None:
+        return ["arm7 mergeFrontmatter: cannot derive the initializer of `%s` (the list the "
+                "walk fills) — fail-closed: re-point this arm" % var]
+    init_end = stmt_end(body_masked, d.end())
+    init = body[d.end():init_end]
+    out = []
+    if "---" in init:
+        out.append(
+            "arm7 mergeFrontmatter seeds `%s` with a delimiter literal (%s) — the emitted "
+            "document opens with a doubled `---`, so the written SKILL.md no longer parses "
+            "as frontmatter" % (var, " ".join(init.split())[:80]))
+    pre = body[:m.start()]
+    if re.search(r"\b%s\s*\+=\s*[^\n]*---" % re.escape(var), pre) or \
+            re.search(r"\b%s\s*\.\s*add(?:All)?\s*\([^)]*---" % re.escape(var), pre):
+        out.append(
+            "arm7 mergeFrontmatter adds a delimiter literal to `%s` before the walk — the "
+            "opening `---` would be emitted twice" % var)
+    if '---' not in body:
+        out.append("arm7 mergeFrontmatter never emits an opening `---` — the merged document "
+                   "has no frontmatter delimiter at all")
+    return out
+
+
+RESOLVE_TARGET_CALL = "resolveUpdateTargetId("
+EMPTY_COLL_RE = re.compile(
+    r"^(?:empty(?:List|Set|Sequence|Array|Map)|listOf|mutableListOf|setOf|mutableSetOf|"
+    r"sequenceOf|mapOf|mutableMapOf|arrayListOf)\s*(?:<[^()]*>)?\s*\(\s*\)$")
+LITERAL_COLL_RE = re.compile(
+    r"^(?:listOf|mutableListOf|setOf|mutableSetOf|arrayListOf|sequenceOf)\s*(?:<[^()]*>)?\s*\(")
+
+
+def resolve_target_first_arg_problems(sb_nc):
+    """arm10 (dataflow): the update-target resolution must be fed the LIVE
+    candidate set.
+
+    The pre-fix criterion proved only that a `val x = resolveUpdateTargetId(`
+    statement sits before the import and that its result is carried. Passing
+    `emptyList()` satisfies all of that: the resolver can never match, so every
+    update of an already-installed skill duplicates it (or lands a new copy
+    under slugify(name)) — the exact defect arm10 exists for.
+
+    Criterion: every call site (except the declaration) is checked at the
+    ARGUMENT level: the candidate set must not be an empty / literal constant.
+    An unparseable call fail-closes."""
+    out = []
+    for m in re.finditer(re.escape(RESOLVE_TARGET_CALL), sb_nc):
+        prefix = sb_nc[max(0, m.start() - 24):m.start()]
+        if re.search(r"\bfun\s+$", prefix):
+            continue  # the declaration itself
+        block = call_arg_block(sb_nc, m.start())
+        if block is None:
+            out.append("arm10 resolveUpdateTargetId call at offset %d: arguments do not "
+                       "balance (fail-closed)" % m.start())
+            continue
+        inner = block[block.find("(") + 1:-1]
+        args = split_top_level(inner)
+        first = args[0] if args else ""
+        flat = re.sub(r"\s+", " ", first).strip()
+        if not flat:
+            out.append("arm10 resolveUpdateTargetId is called with no candidate set — the "
+                       "dedup can never resolve an existing skill, so every update "
+                       "duplicates it")
+        elif EMPTY_COLL_RE.match(flat) or flat == "null":
+            out.append(
+                "arm10 resolveUpdateTargetId is fed a CONSTANT candidate set (`%s`) — the "
+                "resolver can never match an installed skill, so the update path is dead "
+                "code and every refresh duplicates the skill" % flat)
+        elif LITERAL_COLL_RE.match(flat) and "." not in flat:
+            out.append(
+                "arm10 resolveUpdateTargetId is fed a literal list (`%s`) instead of the "
+                "live skill set — the dedup decision is detached from the repository "
+                "(%s)" % (flat[:60], "fail-closed" if "." not in flat else ""))
+    return out
+
+
 def run_checks_text(sr_text, sm_text, sb_text=None):
     sr_nc = strip_comments(sr_text)
     sm_nc = strip_comments(sm_text)
@@ -224,6 +532,11 @@ def run_checks_text(sr_text, sm_text, sb_text=None):
     check("arm2 pre-fix polarity expression gone",
           OLD_POLARITY not in sr_nc,
           "`existing ?: skill.frontmatter` still present (code, not comment)")
+    # arm1 (dataflow) — the signature alone does not prove polarity: the body
+    # must GUARD the fresh block. Derived from the expression body, so an
+    # operand swap (or a third source) goes red instead of passing on the
+    # parameter order.
+    failures.extend(check_resolve_polarity(sr_nc, sr_masked))
 
     # arm3: update() carries + re-seeds
     update_body = function_body(sr_nc, sr_masked, "fun update(")
@@ -261,6 +574,10 @@ def run_checks_text(sr_text, sm_text, sb_text=None):
     check("arm7 doubled walk gone from mergeFrontmatter",
           merge_body is not None and MERGE_WALK_DOUBLED not in merge_body,
           "renameFrontmatterName's `0 until` offset loop is a different, correct site")
+    # arm7 (dataflow) — the walk's lower bound proves only that the SOURCE's
+    # opening delimiter is skipped; seeding the accumulator puts a second `---`
+    # into the emitted document instead.
+    failures.extend(check_merge_seed(sr_nc, sr_masked))
 
     # arm8: the viewer renders through the single merge exit
     viewer_idx = sm_nc.find("val initialContent = remember")
@@ -344,6 +661,11 @@ def run_checks_text(sr_text, sm_text, sb_text=None):
                   "expected the success HUD to pick %s / %s on '%s != null' "
                   "inside the if (skill != null) branch (ROT — update this gate)"
                   % (SB_MSG_UPDATED, SB_MSG_IMPORTED, dedup_var))
+
+    # arm10 (dataflow): the resolution must be fed the LIVE candidate set — a
+    # `emptyList()` satisfies every structural arm above while making the
+    # dedup decision permanently false.
+    failures.extend(resolve_target_first_arg_problems(sb_nc))
 
     return failures
 
@@ -610,6 +932,27 @@ DIRTY_SB_ALWAYS_IMPORTED = GOOD_SB.replace(
     """        val messageRes = R.string.skills_browser_success_imported
 """)
 
+# ── wide-1024 witnesses (each mechanically reproduced on the real tree:
+# pre-fix rc=0, post-fix rc=1) ────────────────────────────────────────────
+
+# W1 (dataflow): the merge base's OPERANDS swap while the signature keeps the
+# fresh block first — "polarity lives in the parameter order" is not true.
+DIRTY_SR_POLARITY_BODY = GOOD_SR.replace(
+    "): String? = newFrontmatter?.ifBlank { null } ?: diskContent",
+    "): String? = diskContent?.ifBlank { null } ?: newFrontmatter")
+
+# W2 (dataflow): the accumulator is SEEDED with a delimiter, so the walk's
+# `1 until` lower bound is satisfied while the document gets a doubled `---`.
+DIRTY_SR_SEED_DELIM = GOOD_SR.replace(
+    "            val fm = mutableListOf<String>()",
+    '            val fm = mutableListOf("---")')
+
+# W3 (dataflow): the dedup resolver is fed a constant candidate set — every
+# structural arm10 criterion above still holds.
+DIRTY_SB_EMPTY_TARGETS = GOOD_SB.replace(
+    "resolveUpdateTargetId(rows, slug = slugify(parsed.name), incomingName = parsed.name)",
+    "resolveUpdateTargetId(emptyList(), slug = slugify(parsed.name), incomingName = parsed.name)")
+
 
 def selftest():
     # tempfile.mkdtemp resolves through the guest-tmp translation (host-side
@@ -624,7 +967,7 @@ def selftest():
     print("selftest clean tree: %s" % ("PASS" if not f else "FAIL %s" % f))
     ok &= not f
 
-    for label, sr_t, sm_t, sb_t in [
+    for entry in [
         ("polarity reverted", DIRTY_SR_POLARITY, GOOD_SM, GOOD_SB),
         ("delimiter walk reverted", DIRTY_SR_WALK, GOOD_SM, GOOD_SB),
         ("update() loses frontmatter param", DIRTY_SR_UPDATE, GOOD_SM, GOOD_SB),
@@ -635,11 +978,23 @@ def selftest():
         ("browser import without dedup", GOOD_SR, GOOD_SM, DIRTY_SB_NO_DEDUP),
         ("browser dedup id not carried", GOOD_SR, GOOD_SM, DIRTY_SB_NO_PASSTHROUGH),
         ("browser HUD always says imported", GOOD_SR, GOOD_SM, DIRTY_SB_ALWAYS_IMPORTED),
+        # wide-1024 witnesses — the needle pins WHICH criterion fired, so a
+        # fixture cannot go red on an unrelated arm and count as evidence.
+        ("merge base operands swapped", DIRTY_SR_POLARITY_BODY, GOOD_SM, GOOD_SB,
+         "does not GUARD the fresh block"),
+        ("merge list seeded with a delimiter", DIRTY_SR_SEED_DELIM, GOOD_SM, GOOD_SB,
+         "seeds `fm` with a delimiter literal"),
+        ("dedup fed a constant candidate set", GOOD_SR, GOOD_SM, DIRTY_SB_EMPTY_TARGETS,
+         "CONSTANT candidate set"),
     ]:
+        label, sr_t, sm_t, sb_t = entry[:4]
+        needle = entry[4] if len(entry) > 4 else None
         f = run(sr_t, sm_t, sb_t)
         red = len(f) > 0
-        print("selftest dirty %-38s: %s %s" % (label, "RED" if red else "NOT-RED", f[:1]))
-        ok &= red
+        hit = needle is None or any(needle in x for x in f)
+        print("selftest dirty %-38s: %s %s"
+              % (label, "RED" if (red and hit) else ("WRONG-ARM" if red else "NOT-RED"), f[:1]))
+        ok &= red and hit
 
     print(SELFTEST_MARK if ok else "SKILL_FRONTMATTER_ROUNDTRIP_SELFTEST=FAIL")
     return 0 if ok else 1

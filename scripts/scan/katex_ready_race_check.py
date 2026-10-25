@@ -87,6 +87,81 @@ def line_of(text: str, needle: str) -> int:
     return text[:pos].count("\n") + 1 if pos >= 0 else -1
 
 
+# ── wide-1024 helpers ─────────────────────────────────────────────────────
+# Four blind spots in this gate, all the same shape: the gate asserted that a
+# token existed, not that the value it computes is the one used.
+ANNOTATION_ONLY_RE = re.compile(r"^@[A-Za-z_][\w.]*(?:\([^()]*\))?$")
+
+
+def enclosing_heads(src: str, idx: int):
+    """Heads of every `{ … }` block enclosing [idx], innermost first."""
+    heads = []
+    depth = 0
+    i = idx
+    while i >= 0:
+        c = src[i]
+        if c == "}":
+            depth += 1
+        elif c == "{":
+            if depth == 0:
+                j = i - 1
+                while j >= 0 and src[j] in " \t\n":
+                    j -= 1
+                end = j + 1
+                while j >= 0 and src[j] not in "\n;{}":
+                    j -= 1
+                heads.append(src[j + 1:end].strip())
+            else:
+                depth -= 1
+        i -= 1
+    return heads
+
+
+def conditional_context(src: str, idx: int):
+    """Head of the enclosing conditional (`if (…)`, `else`, `while (…)`,
+    `when`) that gates the statement at [idx], else None."""
+    for head in enclosing_heads(src, idx):
+        if re.match(r"^(?:if|else|while|when|until)\b", head) or head.startswith("else"):
+            return head
+    line_start = src.rfind("\n", 0, idx) + 1
+    prefix = src[line_start:idx]
+    if re.search(r"\b(?:if|while)\s*\([^)]*\)\s*$", prefix):
+        return prefix.strip()
+    return None
+
+
+def in_discarded_lambda(src: str, idx: int) -> bool:
+    """`x.also { … }` / `x.apply { … }` hand their receiver on and throw the
+    block's value away."""
+    for head in enclosing_heads(src, idx):
+        if head.endswith(".also") or head.endswith(".apply"):
+            return True
+    return False
+
+
+def annotation_only_lines_above(text: str, decl_idx: int):
+    """Annotation lines attached to the declaration at [decl_idx].
+
+    A line counts only when it carries NOTHING but annotations — the anchor
+    drift this closes is `@Synchronized private fun noopLock() {}` sitting in
+    the 80-char window above an unlocked `resolveKey`. A real modifier line or
+    another function body terminates the search.
+    """
+    prefix = text[:decl_idx]
+    lines = prefix.split("\n")[:-1]
+    anns = []
+    for line in reversed(lines):
+        s = line.strip()
+        if not s:
+            continue
+        if ANNOTATION_ONLY_RE.match(s):
+            anns.append(s)
+            continue
+        break
+    return anns
+
+
+
 def analyse(katex_code: str, store_code: str) -> list[tuple[str, bool, str, int]]:
     """katex_code / store_code = comment-stripped sources of the two files."""
     out: list[tuple[str, bool, str, int]] = []
@@ -122,9 +197,33 @@ def analyse(katex_code: str, store_code: str) -> list[tuple[str, bool, str, int]
         out.append((CRIT_A3, False, "KatexReadyGate.markPageFinished not found", -1))
     else:
         sync = re.search(r"val d = synchronized\(lock\) \{\s*ready = true\s*waiter\s*\}", mpf)
-        ok = bool(sync) and "d?.complete(Unit)" in mpf
+        # [wide-1024 A3] the captured waiter must actually be completed on the
+        # settlement path: `if (!ready) d?.complete(Unit)` sits right where the
+        # old arm looked and can never run (ready was just set true inside the
+        # lock), so every pre-ready render times out.
+        done_ok, done_detail = False, "the waiter taken under the lock is never completed"
+        cap = re.search(r"val\s+([A-Za-z_]\w*)\s*=\s*synchronized\s*\(\s*lock\s*\)\s*\{", mpf)
+        if cap:
+            name = cap.group(1)
+            null_check = re.compile(
+                r"^if\s*\(\s*(?:" + re.escape(name) + r"\s*!==?\s*null|null\s*!==?\s*"
+                + re.escape(name) + r")\s*\)$")
+            for m in re.finditer(re.escape(name) + r"\s*\??\.\s*complete\s*\(", mpf):
+                guard = conditional_context(mpf, m.start())
+                if guard and null_check.match(guard.strip()):
+                    guard = None  # `if (d != null) d.complete(…)` == `d?.complete(…)`
+                if guard:
+                    done_detail = ("the completion `%s` sits under `%s` — a guarded completion "
+                                   "skips exactly the requests that were already waiting"
+                                   % (m.group(0).strip(), guard[:60]))
+                    continue
+                done_ok = True
+                break
+        ok = bool(sync) and done_ok
         if not ok:
-            out.append((CRIT_A3, False, "flag flip + waiter take not one atomic step (or completion inside the lock)", -1))
+            out.append((CRIT_A3, False,
+                        "flag flip + waiter take not one atomic step (or completion inside the "
+                        "lock / conditional): " + done_detail, -1))
         else:
             out.append((CRIT_A3, True, "", line_of(katex_code, "fun markPageFinished()")))
 
@@ -138,8 +237,23 @@ def analyse(katex_code: str, store_code: str) -> list[tuple[str, bool, str, int]
             r"waiter \?: CompletableDeferred<Unit>\(\)\.also \{ waiter = it \}",
             await_fn,
         )
-        ok = bool(sync) and "withTimeoutOrNull(timeoutMs)" in await_fn
-        out.append((CRIT_A4, ok, "" if ok else "check-then-act not under one lock in await()", -1))
+        # [wide-1024 A4] the value AWAITED must be the deferred taken/registered
+        # under the lock. `withTimeoutOrNull(ms) { CompletableDeferred<Unit>().await() }`
+        # keeps every token the old arm matched and waits on a deferred nobody
+        # will ever complete — a guaranteed timeout.
+        awaited_ok, awaited_detail = False, "the timeout body awaits something other than the locked deferred"
+        cap = re.search(r"val\s+([A-Za-z_]\w*)\s*=\s*synchronized\s*\(\s*lock\s*\)\s*\{", await_fn)
+        if cap:
+            for m in re.finditer(r"withTimeoutOrNull\s*\(([^)]*)\)\s*\{([^{}]*)\}", await_fn):
+                if re.search(r"\b" + re.escape(cap.group(1)) + r"\s*\.\s*await\s*\(", m.group(2)):
+                    awaited_ok = True
+                    break
+                awaited_detail = ("the timeout body awaits `%s` instead of the `%s` produced "
+                                  "under the lock" % (" ".join(m.group(2).split())[:70],
+                                                      cap.group(1)))
+        ok = bool(sync) and awaited_ok
+        out.append((CRIT_A4, ok, "" if ok else "check-then-act not under one lock in await()"
+                    if not sync else awaited_detail, -1))
 
     # ---- B1/B2: resolveKey locked + still a real lookup ----
     rk = find_block(store_code, r"private fun resolveKey\(sessionId: String\)")
@@ -147,10 +261,22 @@ def analyse(katex_code: str, store_code: str) -> list[tuple[str, bool, str, int]
         out.append((CRIT_B1, False, "resolveKey not found", -1))
         out.append((CRIT_B2, False, "resolveKey not found", -1))
     else:
-        rk_lines = store_code[: store_code.find("private fun resolveKey(sessionId: String)")].splitlines()[-3:]
-        # annotation sits in the (up to 3) lines above the declaration
-        annotated = any("@Synchronized" in l for l in rk_lines)
-        out.append((CRIT_B1, annotated, "" if annotated else "no @Synchronized on resolveKey", -1))
+        decl_idx = store_code.find("private fun resolveKey(sessionId: String)")
+        line_start = store_code.rfind("\n", 0, decl_idx) + 1
+        own_line = store_code[line_start:decl_idx]
+        # [wide-1024 B1] the annotation must be attached to THIS declaration.
+        # The old arm read a fixed 3-line window, so `@Synchronized private fun
+        # noopLock() {}` one line above made an UNLOCKED resolveKey look locked.
+        anns = annotation_only_lines_above(store_code, decl_idx)
+        annotated = ("@Synchronized" in own_line
+                     or any("@Synchronized" in a for a in anns))
+        detail = ""
+        if not annotated:
+            stray = [s.strip() for s in store_code[:decl_idx].split("\n")[-6:] if "@Synchronized" in s]
+            detail = ("no @Synchronized on resolveKey"
+                      + (" — the annotation in the window above belongs to another declaration: `%s`"
+                         % stray[-1] if stray else ""))
+        out.append((CRIT_B1, annotated, detail, line_of(store_code, "private fun resolveKey(")))
         looks_up = "aliases[sessionId]" in rk
         out.append((CRIT_B2, looks_up, "" if looks_up else "resolveKey no longer reads aliases[sessionId]", -1))
 
@@ -162,8 +288,19 @@ def analyse(katex_code: str, store_code: str) -> list[tuple[str, bool, str, int]
     else:
         seg = getter.group(0)
         out.append((CRIT_B3, "@Synchronized" in seg, "" if "@Synchronized" in seg else "getter not @Synchronized", -1))
-        resolves = "resolveKey(it)" in seg
-        out.append((CRIT_B4, resolves, "" if resolves else "getter no longer resolves aliases", -1))
+        # [wide-1024 B4] the getter must PUBLISH the resolver's value: an
+        # `.also { … resolveKey(it) … }` chain returns the un-resolved receiver,
+        # so a draft key reaches `minis-config session.*` verbatim.
+        pos = seg.find("resolveKey(")
+        if pos < 0:
+            out.append((CRIT_B4, False, "getter no longer resolves aliases", -1))
+        elif in_discarded_lambda(seg, pos):
+            out.append((CRIT_B4, False,
+                        "the getter calls resolveKey inside .also/.apply, so the value it "
+                        "publishes is the un-resolved key (a draft `__new__…` id reaches "
+                        "minis-config verbatim)", -1))
+        else:
+            out.append((CRIT_B4, True, "", -1))
     return out
 
 
@@ -354,6 +491,80 @@ def selftest() -> int:
             ok = False
         else:
             print("[selftest C] missing store file red: OK")
+
+        # ---- wide-1024 witnesses -------------------------------------------
+        def rep(text: str, old: str, new: str, label: str) -> str:
+            """Exact replacement; a miss must fail the selftest, never become a
+            silent no-op arm (the arm would then assert on the un-mutated
+            fixture and pass for the wrong reason)."""
+            if text.count(old) != 1:
+                sys.exit("MUTATION ANCHOR BROKEN (%s): expected exactly 1 occurrence, got %d"
+                         % (label, text.count(old)))
+            return text.replace(old, new, 1)
+
+        def expect(sub_name: str, katex: str, store: str, needle: str, want_red=True):
+            nonlocal ok
+            r = write_pair("w_" + sub_name.replace(" ", "_"), katex, store)
+            v = scan(r)
+            hit = any(needle in x for x in v)
+            if want_red and not hit:
+                print(f"[selftest W-{sub_name}] EXPECTED red ({needle!r}), got: {v!r}")
+                ok = False
+            elif not want_red and v:
+                print(f"[selftest W-{sub_name}] EXPECTED GREEN, got: {v!r}")
+                ok = False
+            else:
+                print(f"[selftest W-{sub_name}] {'red as expected' if want_red else 'green'}: OK")
+
+        # W-A3: the waiter is taken atomically but the completion is gated on a
+        # condition that is false on that very path -> every early waiter times out.
+        expect("A3 (completion gated on !ready)",
+               rep(FIXED_KATEX, "        d?.complete(Unit)",
+                   "        if (!ready) d?.complete(Unit)", "W-A3"),
+               FIXED_STORE, "A3")
+
+        # W-A4: the timeout body awaits a brand-new deferred nobody completes.
+        expect("A4 (awaits a fresh deferred)",
+               rep(FIXED_KATEX,
+                   "withTimeoutOrNull(timeoutMs) { d.await() }",
+                   "withTimeoutOrNull(timeoutMs) { CompletableDeferred<Unit>().await() }",
+                   "W-A4"),
+               FIXED_STORE, "A4")
+
+        # W-B4: resolveKey lands inside `.also`, so the getter publishes the
+        # un-resolved draft key while still "calling" the resolver.
+        expect("B4 (resolveKey inside .also)",
+               FIXED_KATEX,
+               rep(FIXED_STORE,
+                   "@Synchronized get() = activeSessionIdInternal?.let { resolveKey(it) }",
+                   "@Synchronized get() = activeSessionIdInternal.also { it?.let { resolveKey(it) } }",
+                   "W-B4"),
+               "B4")
+
+        # W-B1: the annotation in the window above belongs to another function.
+        expect("B1 (annotation belongs to noopLock)",
+               FIXED_KATEX,
+               rep(FIXED_STORE,
+                   "    @Synchronized\n    private fun resolveKey",
+                   "    @Synchronized private fun noopLock() {}\n    private fun resolveKey",
+                   "W-B1"),
+               "B1")
+
+        # W-A3 green: an equivalent null-check completion must not be dragged
+        # into the red set by the new criterion.
+        expect("A3 (null-check completion spelled out)",
+               rep(FIXED_KATEX, "        d?.complete(Unit)",
+                   "        if (d != null) d.complete(Unit)", "W-A3-green"),
+               FIXED_STORE, "", want_red=False)
+
+        # W-B4 green: publishing the resolved value through a `?.let` chain.
+        expect("B4 (resolved value via let)",
+               FIXED_KATEX,
+               rep(FIXED_STORE,
+                   "@Synchronized get() = activeSessionIdInternal?.let { resolveKey(it) }",
+                   "@Synchronized get() = activeSessionIdInternal?.let { raw -> resolveKey(raw) }",
+                   "W-B4-green"),
+               "", want_red=False)
 
     if ok:
         print(SELFTEST_MARKER)

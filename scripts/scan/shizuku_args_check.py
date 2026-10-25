@@ -40,6 +40,19 @@ Criteria (all structural; the file must be the real handler):
      the payload reaching the output shaper (`exec grep -q foo /p` did, via
      `-q` → `--quiet`) makes it drop the whole `data` object on a non-zero exit,
      and the un-lifted option is executed by the shell.
+     [wide-1024] …and the lift must ACTUALLY happen: the helper's body is
+     judged (loop + option literal + two accumulators + no early return), not
+     its existence. `if (true) return tokens to tokens` used to stay green.
+
+ 14. [wide-1024] the netpolicy direction is judged inside the `arrayOf(...)`
+     that is an ARGUMENT of the call. The old anchor took the first textual
+     mention of the list name, so a dead `val x = arrayOf(…)` one line above
+     the real `runProcess(...)` absorbed it.
+
+ 15. [wide-1024] "no fallback to root" is judged as a SPELLING CLASS: every
+     `?:` whose fallback evaluates to "0" (`?: "0"`, `?: (0).toString()`,
+     `?: 0.toString()`, `?: Integer.toString(0)`, `?: "$0"`). Pinning the one
+     literal let a re-spelled root fallback through.
 
 A renamed function is a HARD FAIL, never a skip (the gate must not go quiet
 because the code moved).
@@ -146,16 +159,8 @@ def line_of(src, needle):
     return src.count("\n", 0, i) + 1 if i >= 0 else 0
 
 
-def _call_literal(src, list_name):
-    """The innermost `arrayOf(...)` argument list that names `list_name`.
-
-    Decision-point binding: the direction must be chosen inside the very
-    argument list that names the netpolicy list — a direction flipped somewhere
-    else in the file is not this call site.
-    """
-    i = src.find('"%s"' % list_name)
-    if i < 0:
-        return None
+def _array_span(src, i):
+    """(start, end) of the `arrayOf(...)` enclosing index [i], or None."""
     j = src.rfind("arrayOf(", 0, i)
     if j < 0:
         return None
@@ -168,7 +173,129 @@ def _call_literal(src, list_name):
             if depth == 0:
                 break
         k += 1
-    return src[j:k + 1]
+    if k >= len(src) or not (j < i < k):
+        return None
+    return j, k + 1
+
+
+def _call_literals(src, list_name):
+    """Every `arrayOf(...)` that names [list_name] AND is handed to a call.
+
+    Decision-point binding, by CALL FRAME rather than by first textual hit
+    ([wide-1024 Criterion 14]). The old anchor took `src.find('"<list>"')` —
+    the first mention of the list name in the file — and walked back to the
+    nearest `arrayOf(`. A dead `val _unused = arrayOf(… "list" …)` placed one
+    line above the real call therefore absorbed the anchor, and the direction
+    actually executed by `runProcess(` was never read (a shipped inversion
+    stayed green). Here the subject is the array that is an ARGUMENT of a call
+    (`run(` / `ShizukuManager.runProcess(`); an array bound to a `val` is not
+    executed by this handler and is not this criterion's subject.
+
+    Returns [(text, is_call_arg)] so the caller can require at least one live
+    site (fail-closed) and judge every live one.
+    """
+    out = []
+    seen = set()
+    for m in re.finditer(r'"%s"' % re.escape(list_name), src):
+        span = _array_span(src, m.start())
+        if span is None:
+            continue
+        if span in seen:
+            continue
+        seen.add(span)
+        j, k = span
+        prefix = src[max(0, j - 60):j]
+        is_arg = re.search(r"[A-Za-z_][\w.]*\s*\(\s*$", prefix) is not None
+        out.append((src[j:k], is_arg))
+    return out
+
+
+def _option_spellings(src, option):
+    """Every spelling that identifies [option]: the literal, plus each constant
+    bound to it in this file (`private const val EXEC_TIMEOUT_OPT =
+    "--timeout-ms"`). A named constant is the same decision written once, not a
+    second spelling — the real handler uses it, so a literal-only anchor would
+    red the clean tree."""
+    out = {'"%s"' % option}
+    for m in re.finditer(
+            r"\b(?:const\s+)?val\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?::\s*String\s*)?=\s*\"%s\""
+            % re.escape(option), src):
+        out.add(m.group(1))
+    return out
+
+
+def _strips_option_out(body, spellings):
+    """True when [body] really lifts [option] out of its input list.
+
+    [wide-1024 Criterion 13] "the helper exists and the splitter calls it" is
+    not "the helper strips". A first line `if (true) return tokens to tokens`
+    (or any early `return <in> to <in>`) satisfies both anchors while the
+    payload keeps `--timeout-ms`, and the shell then executes the flag as the
+    command name. So the body must enumerate its input, compare against the
+    option literal, fill two distinct accumulators, and only return after the
+    loop — the returned pair must be those two accumulators.
+    """
+    if body is None:
+        return False, "helper MISSING"
+    if not any(sp in body for sp in spellings):
+        return False, "the body never names the option (no %s)" % " / ".join(sorted(spellings))
+    loop = re.search(r"\b(?:while|for)\s*\(", body)
+    if loop is None:
+        return False, "no loop over the tokens"
+    ret = body.find("return")
+    if ret >= 0 and ret < loop.start():
+        return False, "returns before the loop (an early exit leaves the option in the payload)"
+    adds = set(re.findall(r"\b([A-Za-z_]\w*)\.add(?:All)?\(", body))
+    tail = re.search(r"return\s+([A-Za-z_]\w*)\s+to\s+([A-Za-z_]\w*)", body)
+    if tail is None:
+        return False, "no `return <payload> to <options>`"
+    if tail.group(1) not in adds or tail.group(2) not in adds:
+        return False, "the returned pair is not the two accumulators the loop fills"
+    if tail.group(1) == tail.group(2):
+        return False, "the pair returns the same list twice"
+    return True, "ok"
+
+
+# ── [wide-1024 Criterion 15] spellings that all evaluate to the string "0" ──
+# The shipped defect was `?: "0"` (an unresolvable uid becoming uid 0 = root).
+# Pinning that one literal missed every equivalent: `?: (0).toString()`,
+# `?: 0.toString()`, `?: Integer.toString(0)`, `?: "$0"`. The criterion now
+# normalises the elvis fallback expression and compares it against the set of
+# zero-yielding spellings, so the shape is judged, not the typing.
+_ZERO_SPELLINGS = {
+    '"0"', '0.tostring()', '(0).tostring()', '0l.tostring()', '(0l).tostring()',
+    'integer.tostring(0)', 'long.tostring(0)', 'string.valueof(0)',
+    '"0".tostring()', '"$0"', '"${0}"', '0.toint().tostring()',
+}
+
+
+def _expr_at(text, i):
+    """The expression starting at/after [i], up to a depth-0 delimiter."""
+    depth = 0
+    out = []
+    while i < len(text):
+        c = text[i]
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            if depth == 0:
+                break
+            depth -= 1
+        elif depth == 0 and c in "\n,;&|=+":
+            break
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def _zero_fallback(text):
+    """(True, spelling) when some `?:` fallback evaluates to the string "0"."""
+    for m in re.finditer(r"\?:", text):
+        expr = _expr_at(text, m.end())
+        norm = re.sub(r"\s+", "", expr).lower()
+        if norm in _ZERO_SPELLINGS:
+            return True, expr.strip()
+    return False, ""
 
 
 def analyse(src):
@@ -321,14 +448,16 @@ def analyse(src):
     splitter_body = function_body(src, "splitShizukuArgv") or ""
     strips_in_splitter = "stripExecTimeoutTokens(" in splitter_body
     parser_uses_exec_tokens = "split.execOptionTokens" in handle_body
+    strips_out, strip_note = _strips_option_out(
+        strip_body, _option_spellings(src, "--timeout-ms"))
     results.append((
         "13 exec trims its own options out of the shell payload",
-        strip_body is not None and strips_in_splitter and parser_uses_exec_tokens
+        strips_out and strips_in_splitter and parser_uses_exec_tokens
         and "execOptionTokens = " in src,
         line_of(src, "internal fun stripExecTimeoutTokens("),
-        "helper=%s splitter-calls-it=%s handle-feeds-execOptionTokens=%s slot=%s"
+        "helper-strips=%s (%s) splitter-calls-it=%s handle-feeds-execOptionTokens=%s slot=%s"
         % (
-            "present" if strip_body is not None else "MISSING",
+            strips_out, strip_note,
             strips_in_splitter,
             parser_uses_exec_tokens,
             "execOptionTokens = " in src,
@@ -340,17 +469,20 @@ def analyse(src):
     #     to it; `restrict-background-blacklist` runs the other way. The shipped
     #     code had the wifi pair inverted, so `network restrict --wifi` kept the
     #     package online (and `network allow --wifi` cut it off).
-    wl = _call_literal(src, "restrict-background-whitelist")
-    bl = _call_literal(src, "restrict-background-blacklist")
-    wl_ok = wl is not None and 'if (restrict) "remove" else "add"' in wl
-    bl_ok = bl is not None and 'if (restrict) "add" else "remove"' in bl
+    wl_sites = _call_literals(src, "restrict-background-whitelist")
+    bl_sites = _call_literals(src, "restrict-background-blacklist")
+    wl_live = [t for t, is_arg in wl_sites if is_arg]
+    bl_live = [t for t, is_arg in bl_sites if is_arg]
+    wl_bad = [t for t in wl_live if 'if (restrict) "remove" else "add"' not in t]
+    bl_bad = [t for t in bl_live if 'if (restrict) "add" else "remove"' not in t]
     results.append((
         "14 netpolicy list direction follows the restrict flag",
-        wl_ok and bl_ok,
+        bool(wl_live) and bool(bl_live) and not wl_bad and not bl_bad,
         line_of(src, "restrict-background-whitelist"),
-        "whitelist=%s blacklist=%s"
-        % ("remove-on-restrict" if wl_ok else "MISSING or INVERTED",
-           "add-on-restrict" if bl_ok else "MISSING or INVERTED"),
+        "live array arguments: whitelist=%d (%d with the wrong direction), "
+        "blacklist=%d (%d); direction must be chosen inside the array that is "
+        "passed to the call, dead `val x = arrayOf(...)` copies are not call sites"
+        % (len(wl_live), len(wl_bad), len(bl_live), len(bl_bad)),
     ))
 
     # 15. An unresolvable uid must refuse, never fall back to uid 0 (root).
@@ -367,14 +499,25 @@ def analyse(src):
         r"pkgUid\(pkg\)\?\.toIntOrNull\(\)\s*\?:\s*return\s+errEnvelope\(", net_stats) is not None
     resolver_nullable = re.search(
         r"internal fun extractUidFromDumpsys\([^)]*\)\s*:\s*String\?\s*=", src) is not None
-    no_zero_fallback = '?: "0"' not in src
+    resolver_body = function_body(src, "extractUidFromDumpsys") or ""
+    zero_hit, zero_note = "", ""
+    for scoped in (resolver_body, net_restrict, net_stats):
+        hit, spelling = _zero_fallback(scoped)
+        if hit:
+            zero_hit, zero_note = scoped, spelling
+            break
+    no_zero_fallback = not zero_hit
     no_neg_one = "?: -1" not in net_stats
     results.append((
         "15 unresolvable uid refuses instead of aiming at root",
         restrict_refuses and stats_refuses and resolver_nullable and no_zero_fallback and no_neg_one,
         line_of(src, "val uid = pkgUid(pkg)"),
-        "restrict-refuses=%s stats-refuses=%s resolver-String?=%s no-zero=%s no-minus-one=%s"
-        % (restrict_refuses, stats_refuses, resolver_nullable, no_zero_fallback, no_neg_one),
+        "restrict-refuses=%s stats-refuses=%s resolver-String?=%s no-zero-fallback=%s%s no-minus-one=%s"
+        % (
+            restrict_refuses, stats_refuses, resolver_nullable, no_zero_fallback,
+            "" if no_zero_fallback else " (found `?: %s`)" % zero_note,
+            no_neg_one,
+        ),
     ))
     # [dv15-A1 A-02] the value-taking short options are declared ONCE and that
     # declaration is what both call sites pass. Fail-closed: the set must be
@@ -608,6 +751,29 @@ EXTRA_BREAKERS = [
     ("1c the pre-scan probe stops threading the value shorts",
      "val probe = OffloadArgs(argv, booleanFlags = booleanFlags, valueShortOptions = valueShortOptions)",
      "val probe = OffloadArgs(argv, booleanFlags = booleanFlags)", "1 "),
+    # ── [wide-1024] the three witnesses this branch was handed ────────────
+    # Criterion 14 (anchor axis): a DEAD arrayOf above the real call used to
+    # absorb the first-mention anchor, so the direction actually executed by
+    # `runProcess(` was never read. The live call below is inverted.
+    ("14b a dead arrayOf absorbs the anchor and the live call is inverted",
+     '            val r = ShizukuManager.runProcess(arrayOf("cmd", "netpolicy",\n'
+     '                if (restrict) "remove" else "add", "restrict-background-whitelist", uid))',
+     '            val _unused = arrayOf("cmd", "netpolicy", if (restrict) "remove" else "add", '
+     '"restrict-background-whitelist", uid)\n'
+     '            val r = ShizukuManager.runProcess(arrayOf("cmd", "netpolicy", '
+     'if (restrict) "add" else "remove", "restrict-background-whitelist", uid))', "14 "),
+    # Criterion 13 (dataflow axis): the helper exists and the splitter calls it,
+    # but it short-circuits — the option stays in the shell payload.
+    ("13d the helper short-circuits and hands the payload back unchanged",
+     "internal fun stripExecTimeoutTokens(tokens: List<String>): "
+     "Pair<List<String>, List<String>> {\n",
+     "internal fun stripExecTimeoutTokens(tokens: List<String>): "
+     "Pair<List<String>, List<String>> {\n    if (true) return tokens to tokens\n", "13 "),
+    # Criterion 15 (spelling axis): the same root fallback, spelled as an
+    # expression instead of the literal `"0"`.
+    ("15d the resolver falls back to a re-spelled root uid",
+     r'Regex("""userId=(\d+)""").find(dumpsysOutput)?.groupValues?.get(1)',
+     r'Regex("""userId=(\d+)""").find(dumpsysOutput)?.groupValues?.get(1) ?: (0).toString()', "15 "),
 ]
 # criterion 4 has two halves; break the global-trim half explicitly
 BREAKERS[4] = (

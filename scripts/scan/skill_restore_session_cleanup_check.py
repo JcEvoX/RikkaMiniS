@@ -77,11 +77,21 @@ ENSURE_CALL = "ensureSession("
 # The two single-source writers that associate text with a session durably.
 # Both live in ChatRepository and both refresh `last_message` + `updated_at`.
 DURABLE_WRITES = ("appendMessage(", "updateSessionPreview(")
-# `_inputText.value = "<literal>` — assigning a CONSTANT to the composer. In
-# this function the only such constant is the blank, i.e. "destroy the in-memory
-# copy"; a variable (`= text`) keeps it. Anchored on that decision, not on the
-# spelling of the blank.
-COMPOSER_LITERAL_RE = re.compile(r"_inputText\.value\s*=\s*[\"']")
+# `_inputText.value = <constant>` — assigning a CONSTANT to the composer, i.e.
+# "destroy the in-memory copy"; a variable (`= text`) keeps it.
+#
+# wide-1024: the old spelling (`= "` / `= '`) only knew the literal form, so
+# `_inputText.value = String()` — same destruction, different spelling — was
+# invisible. The class is "any expression whose value cannot depend on `text`":
+# a string literal (masked to spaces by mask_keep_offsets), String(), the
+# String.EMPTY constant, an emptied builder, or a literal `.trim()`.
+COMPOSER_DISCARD_RE = re.compile(
+    r"_inputText\s*\.\s*value\s*=\s*(?:"
+    r"\"[^\n\"]*\"|'[^\n']*'|"
+    r"(?:kotlin\s*\.\s*)?String\s*\(\s*\)|"
+    r"(?:kotlin\s*\.\s*)?String\s*\.\s*EMPTY|"
+    r"buildString\s*\{\s*\}"
+    r")")
 # [dv25-B08 / deep-audit-1045 B-08] The promotion owns the session it creates.
 # The exit sweep must respect that ownership, and the promotion must keep the
 # draft slot recoverable when its durable write did not land.
@@ -143,6 +153,7 @@ MCP_NEW = "mcpRepository = MCPRepository("
 RECORD_DECL = "fun recordSkillUse("
 RECORD_LOCK = "synchronized(addLock)"
 SKILLS_ASSIGN = "_skills.value ="
+SKILLS_STATE = "_skills.value"
 
 # [da1030-A ISSUE-01]
 ENSURE_DECL = "internal suspend fun ChatViewModel.ensureSession("
@@ -271,6 +282,25 @@ def check_record_skill_use_lock(src):
     for p in outside:
         v.append("SkillRepository.kt: '%s' at body offset %d is out of the '%s' block — "
                  "write-back must share the lock with add()" % (SKILLS_ASSIGN, p, RECORD_LOCK))
+
+    # wide-1024 (dataflow): publishing UNDER the lock is not enough. The write
+    # is derived from a read of the same StateFlow, and the DB bump is the
+    # other half of the pair — leaving either outside the lock restores the
+    # lost-increment race the da1029-C fix closed (two concurrent calls both
+    # read the pre-bump snapshot; the DB says +2, memory says +1).
+    assign_starts = set(assigns)
+    for p in [q for q in (m.start() for m in re.finditer(re.escape(SKILLS_STATE), body))
+              if not (lock_open < q < lock_end) and q not in assign_starts]:
+        v.append("SkillRepository.kt: recordSkillUse reads '%s' at body offset %d OUTSIDE the "
+                 "'%s' block — the value the write is derived from must be read under the "
+                 "same lock, otherwise two concurrent calls both read the pre-bump snapshot "
+                 "and one increment is lost in memory" % (SKILLS_STATE, p, RECORD_LOCK))
+    for m in re.finditer(r"\bdb\s*\.\s*execSQL\s*\(", body):
+        if not (lock_open < m.start() < lock_end):
+            v.append("SkillRepository.kt: recordSkillUse issues its use_count bump "
+                     "(db.execSQL) at body offset %d OUTSIDE the '%s' block — the DB half "
+                     "and the memory half of the read-modify-write must be one critical "
+                     "section" % (m.start(), RECORD_LOCK))
     return v
 
 
@@ -291,6 +321,10 @@ def check_skill_repo(src):
 
     # Arm 4 [da1029-C / I04]: recordSkillUse's write-back shares add()'s lock.
     v.extend(check_record_skill_use_lock(src))
+
+    # Arm 1b (dataflow, wide-1024): the resolved id must actually REACH the
+    # policy — `preferredId.let { null }` keeps every anchor of arm 1.
+    v.extend(check_resolve_callee_args(src))
 
     # Arm 8 [dv16-A05]: setSessionOverride sparse-clears when the requested
     # value equals the CURRENT global default; the decision lives in the
@@ -362,6 +396,72 @@ def check_skill_repo(src):
                     "'%s' — a bundled skill may land under a slug other than its "
                     "assets dirName (payload lives in <dirName>/)" % PREFERRED_ID
                 )
+    return v
+
+
+NEUTRALISED_ARG_RE = re.compile(
+    r"(?<![\w.])null\b|(?<![\w.])false\b|!\s*true\b|\btrue\s*==\s*false\b|\"\"|''")
+
+
+def split_top_args(text):
+    """Split a Kotlin argument list on commas at bracket depth 0."""
+    out, buf, depth = [], [], 0
+    for c in text:
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+        if c == "," and depth <= 0:
+            out.append("".join(buf))
+            buf = []
+            continue
+        buf.append(c)
+    out.append("".join(buf))
+    return out
+
+
+def check_resolve_callee_args(src):
+    """Arm 1b (dataflow, wide-1024): the id resolution must be fed `preferredId`
+    ITSELF, not an expression that reduces to a constant.
+
+    Arm 1 proves add()'s `val id =` statement mentions the policy call and the
+    `preferredId` identifier. `resolveImportId(preferredId.let { null },
+    slugify(name))` satisfies both while handing the policy a null — i.e. the
+    caller's already-resolved id is dropped exactly as before
+    [fix/da1021-A]: a renamed / pure-CJK skill (blank slug) is lost, or lands
+    under a fresh slug while its payload and overrides still point at the old
+    one.
+
+    Criterion: for EVERY resolveImportId call site in the file (both entry
+    points — add() and importFromContent), argument 0 must mention
+    `preferredId` and must not contain a constant that neutralises it.
+    Unparseable argument lists fail closed."""
+    v = []
+    code = strip_literals(src)
+    if code is None:
+        return ["SkillRepository.kt: unterminated string/comment literal — cannot read the "
+                "resolveImportId arguments (ROT — update this gate)"]
+    calls = list(re.finditer(re.escape(RESOLVE_CALL), code))
+    if not calls:
+        return v  # arm 1 already reports a missing call on the add() path
+    for m in calls:
+        op = m.end() - 1
+        cp = balanced_index(code, op, "(", ")")
+        if cp < 0:
+            v.append("SkillRepository.kt: resolveImportId argument list does not balance at "
+                     "offset %d (fail-closed)" % m.start())
+            continue
+        args = split_top_args(code[op + 1:cp])
+        arg0 = re.sub(r"\s+", " ", args[0]).strip() if args else ""
+        if "preferredId" not in arg0:
+            v.append("SkillRepository.kt: resolveImportId is called without `preferredId` "
+                     "(`%s`) — the caller's resolved id is dropped and a renamed skill lands "
+                     "under slugify(name) again" % arg0[:80])
+        elif NEUTRALISED_ARG_RE.search(arg0):
+            v.append("SkillRepository.kt: resolveImportId's preferredId argument is "
+                     "NEUTRALISED (`%s`) — the call and the identifier survive, but the value "
+                     "reduces to a constant, so a renamed / pure-CJK skill is lost or lands "
+                     "under a fresh slug (fail-closed)" % arg0[:90])
     return v
 
 
@@ -841,15 +941,16 @@ def check_promote_draft(src):
                  "the write lands against a session id that does not exist yet and is "
                  "silently dropped" % ENSURE_CALL)
 
-    blanks = [m.start() for m in COMPOSER_LITERAL_RE.finditer(body)]
+    blanks = [m.start() for m in COMPOSER_DISCARD_RE.finditer(body)]
     if blanks and wired:
         first_durable = min(wired)
         for b in blanks:
             if b < first_durable:
                 v.append(
                     "ChatSessionEntryExt.kt: promoteDraftIfNeeded blanks the composer "
-                    "(_inputText.value = \"\") BEFORE the durable body write — a cancellation "
-                    "or DB failure in between leaves NO copy of the draft text"
+                    "(a constant is assigned to _inputText.value) BEFORE the durable body "
+                    "write — a cancellation or DB failure in between leaves NO copy of the "
+                    "draft text"
                 )
     return v
 
@@ -1352,6 +1453,40 @@ BAD_SKILL_NO_LOCK = GOOD_SKILL.replace(
 BAD_SKILL_DROP_FUNCTION = GOOD_SKILL.replace(
     "fun recordSkillUse(", "fun recordSkillUseRenamed(")
 
+# ── wide-1024 witnesses (mechanically reproduced on the real tree: pre-fix
+# rc=0, post-fix rc=1) ────────────────────────────────────────────────────
+
+# W1 (dataflow): the policy call and the `preferredId` mention both survive —
+# the argument is neutralised to a constant, so the caller's resolved id is
+# dropped exactly as before [fix/da1021-A].
+BAD_SKILL_NEUTRALISED_ID = GOOD_SKILL.replace(
+    "val id = SkillRestorePolicy.resolveImportId(preferredId, slugify(name))",
+    "val id = SkillRestorePolicy.resolveImportId(preferredId.let { null }, slugify(name))",
+)
+
+# W2 (dataflow): only the PUBLISH is locked; the read it derives from and the
+# DB bump sit outside, so two concurrent calls both read the pre-bump snapshot.
+BAD_SKILL_RMW_OUTSIDE_LOCK = GOOD_SKILL.replace(
+    """        synchronized(addLock) {
+            val current = _skills.value.find { it.id == skillId } ?: return
+            val bumped = current.copy(useCount = current.useCount + 1.0)
+            db.execSQL(
+                "UPDATE skills SET use_count = use_count + 1 WHERE id=?",
+                arrayOf<Any>(skillId)
+            )
+            _skills.value = _skills.value.map { if (it.id == skillId) bumped else it }
+        }""",
+    """        val current = _skills.value.find { it.id == skillId } ?: return
+        val bumped = current.copy(useCount = current.useCount + 1.0)
+        db.execSQL(
+            "UPDATE skills SET use_count = use_count + 1 WHERE id=?",
+            arrayOf<Any>(skillId)
+        )
+        synchronized(addLock) {
+            _skills.value = _skills.value.map { if (it.id == skillId) bumped else it }
+        }""",
+)
+
 # [dv16-A05] the pre-fix shape: INSERT OR REPLACE always — a toggled-back
 # session keeps its pinned row forever (the MCP twin sparse-clears; this one
 # didn't).
@@ -1571,6 +1706,13 @@ BAD_PROMOTE_BLANK_FIRST = GOOD_PROMOTE.replace(
     "    com.rikkaminis.app.data.ComposerDraftStore.clearDraft(context, sessionId)\n",
     "    com.rikkaminis.app.data.ComposerDraftStore.clearDraft(context, sessionId)\n"
     "    _inputText.value = \"\"\n")
+
+# W3 (wide-1024, spelling→effect): the same destruction as BAD_PROMOTE_BLANK_FIRST
+# spelled `String()` instead of `""` — the old `= ["']` regex could not see it.
+BAD_PROMOTE_STRING_BLANK = GOOD_PROMOTE.replace(
+    "    com.rikkaminis.app.data.ComposerDraftStore.clearDraft(context, sessionId)\n",
+    "    com.rikkaminis.app.data.ComposerDraftStore.clearDraft(context, sessionId)\n"
+    "    _inputText.value = String()\n")
 
 # Persisting before the id exists is a no-op against an empty sid.
 BAD_PROMOTE_PERSIST_BEFORE_ENSURE = GOOD_PROMOTE.replace(
@@ -1810,6 +1952,16 @@ def selftest():
     expect_trip("publish-outside-lock fixture (I04)", bad_publish, "out of the", failures)
     expect_trip("no-lock fixture (I04)", bad_nolock, "has no 'synchronized(addLock)'", failures)
     expect_trip("dropped-function fixture (I04)", bad_nofunc, "not found (ROT", failures)
+    # [wide-1024] dataflow: every anchor of arm 1 holds, the value does not.
+    bad_neutralised = check_skill_repo(BAD_SKILL_NEUTRALISED_ID)
+    expect_trip("neutralised-id fixture (wide-1024 W1)", bad_neutralised, "NEUTRALISED", failures)
+    if any("does not consult preferredId" in v or "does not resolve" in v
+           for v in bad_neutralised):
+        failures.append("neutralised-id fixture tripped an UNRELATED arm: %r" % bad_neutralised)
+    bad_rmw = check_skill_repo(BAD_SKILL_RMW_OUTSIDE_LOCK)
+    expect_trip("rmw-outside-lock fixture (wide-1024 W2)", bad_rmw, "OUTSIDE the", failures)
+    if any("publishes" in v for v in bad_rmw):
+        failures.append("rmw-outside-lock fixture tripped an UNRELATED arm: %r" % bad_rmw)
     # [dv16-A05] the pinned-override pre-fix shape fires ONLY the new arm.
     expect_trip("pinned-override fixture (dv16-A05)", bad_pin, "does not DELETE the override row", failures)
     expect_trip("pinned-override fixture (dv16-A05)", bad_pin, "shouldDeleteSessionSkillOverride", failures)
@@ -1940,6 +2092,12 @@ def selftest():
     if len(bad_blank_first) != 1:
         failures.append("blank-before-persist fixture tripped %d arms, expected exactly 1: %r"
                         % (len(bad_blank_first), bad_blank_first))
+    bad_string_blank = check_promote_draft(BAD_PROMOTE_STRING_BLANK)
+    expect_trip("String()-blank promotion (wide-1024 W3)", bad_string_blank,
+                "BEFORE the durable body write", failures)
+    if len(bad_string_blank) != 1:
+        failures.append("String()-blank fixture tripped %d arms, expected exactly 1: %r"
+                        % (len(bad_string_blank), bad_string_blank))
     bad_persist_early = check_promote_draft(BAD_PROMOTE_PERSIST_BEFORE_ENSURE)
     expect_trip("persist-before-ensure promotion (B-06)", bad_persist_early, "BEFORE 'ensureSession('",
                 failures)
